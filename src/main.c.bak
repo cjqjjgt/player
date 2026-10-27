@@ -1,0 +1,1514 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * main.c - RK3572 本地视频播放器主入口
+ *
+ * 数据流:
+ *   MP4/MKV 文件 → FFmpeg av_read_frame → MPP 硬件解码 (NV12)
+ *   → RGA 硬件色彩转换 (NV12 → RGB888) → LVGL 显示
+ *   音频: AAC/MP3 → FFmpeg 软解 → ALSA 播放
+ *
+ * 功能:
+ *   - 本地视频播放 (MP4/MKV/AVI)
+ *   - 音视频同步 (AV_SYNC)
+ *   - 播放控制 (暂停/恢复/seek/倍速/逐帧步进)
+ *   - LVGL 图形界面 (进度条/控制栏/文件浏览器)
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <sys/time.h>
+#include <time.h>
+
+#include "common.h"
+#include "mpp_decode.h"
+#include "rga_convert.h"
+#include "im2d.h"
+#include "lvgl_display.h"
+#include "lvgl_control.h"
+#include "local_playback.h"
+#include "audio_decode.h"
+#include "audio_render.h"
+#include "av_sync.h"
+#include "lvgl.h"
+
+#define LOCAL_VIDEO_DIR  "/userdata/records"
+
+/* ==================== 全局状态 ==================== */
+typedef struct {
+    int             running;
+    void           *mpp_handle;
+    int             video_width;
+    int             video_height;
+    int             video_fps;
+    int             codec_type;
+    csg_player_state_t  state;
+    csg_player_stats_t  stats;
+    pthread_mutex_t mutex;
+
+    void           *rgb_buf;
+    int             rgb_buf_size;
+
+    csg_player_time_t   time_state;
+    int             live;
+    int             step_frame_pending;
+
+    int             local_handle;
+    int             is_local_play;
+
+    int             state_gen;
+    int             mpp_gen;
+
+    int64_t         last_displayed_pts;
+    int             post_resume_sync;
+    int64_t         resume_min_pts;
+    int             resume_keyframe_seen;
+    int64_t         last_keyframe_pts;
+    int             mpp_needs_keyframe;
+    int             mpp_kf_wait_decode;
+    int64_t         seek_target_pts;
+    int64_t         audio_seek_pts;     /* Seek 后音频 PTS 钳制基准 */
+    unsigned int    seek_drop_count;
+    int64_t         expected_kf_pts;
+    volatile int    seek_fast_feed_done;
+
+    /* Seek 后音频就绪等待 */
+    int             waiting_audio_ready;   /* 1=等待音频时钟推进后解冻 */
+    int             audio_wait_frame_count; /* 等待帧计数(超时保护) */
+    int64_t         audio_sync_base_pts;   /* Seek 后音频时钟基准 PTS */
+
+    csg_av_sync_ctx_t     *av_sync_handle;
+    csg_audio_decode_ctx_t *audio_dec_handle;
+    csg_audio_render_ctx_t *audio_render_handle;
+    int              has_audio;
+
+    int              audio_frame_count;
+    int              audio_pcm_count;
+} csg_player_app_ctx_t;
+
+static csg_player_app_ctx_t s_csg_player_app = {0};
+
+static int s_csg_state_gen_counter = 0;
+
+static inline int csg_player_next_state_gen(void) { return ++s_csg_state_gen_counter; }
+static inline int csg_player_current_state_gen(void) { return s_csg_state_gen_counter; }
+
+static struct timespec s_csg_player_stats_time;
+
+static int64_t csg_player_now_us(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000 + ts.tv_nsec / 1000;
+}
+
+/* ==================== 音频回调链 ==================== */
+static void csg_player_on_audio_pcm(void *pcm_data, int samples,
+                         int channels, int rate,
+                         int64_t pts, void *user_data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)user_data;
+    (void)channels;
+    (void)rate;
+    (void)pcm_data;
+    if (!ctx->running) return;
+    if (!ctx->audio_render_handle) return;
+
+    /* Seek 后音频 PTS 钳制:
+     * av_seek_frame 可能使音频流产生与视频关键帧严重不一致的 PTS
+     * (如视频 85s 但音频 PTS 108s)。若直接用此 PTS 设置音频时钟,
+     * 会导致 AV 同步主时钟跳变, 视频永远落后音频 -> 同步失效。
+     * 修复: 用 seek 目标 PTS 作为首帧音频时钟基准, 确保音视频
+     * 时钟起点一致。后续帧的 PTS 偏移由码流自身保证连续性。 */
+    if (ctx->audio_seek_pts > 0) {
+        int64_t diff = pts - ctx->audio_seek_pts;
+        if (diff > 1000000 || diff < -1000000) {
+            CSG_LOGI("MAIN", "Audio PTS clamp: %lld -> %lld (diff=%+lldus)",
+                 (long long)pts, (long long)ctx->audio_seek_pts,
+                 (long long)diff);
+            pts = ctx->audio_seek_pts;
+        }
+        ctx->audio_seek_pts = 0;
+    }
+
+    ctx->audio_pcm_count++;
+    csg_audio_render_write(ctx->audio_render_handle, pcm_data, samples, pts);
+
+    if (ctx->av_sync_handle && pts != CSG_PLAYER_TICK_INVALID) {
+        csg_av_sync_update_audio_clock(ctx->av_sync_handle, pts, samples, rate);
+    }
+
+    if (ctx->audio_pcm_count % 100 == 0) {
+        CSG_LOGI("MAIN", "Audio PCM #%d: %d samples, pts=%lld",
+             ctx->audio_pcm_count, samples, (long long)pts);
+    }
+}
+
+static void csg_player_on_audio_frame(const uint8_t *data, int len,
+                           int64_t pts, int codec_id,
+                           int sample_rate, int channels,
+                           uint64_t channel_layout,
+                           const uint8_t *extradata,
+                           int extradata_size,
+                           void *user_data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)user_data;
+    (void)codec_id;
+    (void)sample_rate;
+    (void)channels;
+    (void)channel_layout;
+    (void)extradata;
+    (void)extradata_size;
+    if (!ctx->running) return;
+    if (!ctx->audio_dec_handle) return;
+
+    ctx->audio_frame_count++;
+    csg_audio_decode_send_packet(ctx->audio_dec_handle, data, len, pts);
+
+    if (ctx->audio_frame_count % 100 == 0) {
+        CSG_LOGI("MAIN", "Audio packet #%d: %d bytes, pts=%lld",
+             ctx->audio_frame_count, len, (long long)pts);
+    }
+}
+
+static void csg_player_on_mpp_frame(void *yuv_data, int yuv_len,
+                         int width, int height, int hor_stride, int ver_stride,
+                         uint64_t pts, int is_keyframe, void *user_data);
+
+static void csg_player_on_local_frame(void *data, int len, int is_keyframe,
+                           uint64_t pts, int codec_type, void *user_data);
+
+static void csg_player_local_event_cb(csg_local_event_t event, void *user_data);
+static void csg_player_local_eof_ui_async(void *data);
+static void csg_player_local_error_cleanup_async(void *data);
+
+/* ==================== 音频管线 ==================== */
+static int csg_player_setup_audio_pipeline(csg_player_app_ctx_t *ctx, int local_handle)
+{
+    int codec_id = 0, sample_rate = 0, channels = 0;
+    uint64_t channel_layout = 0;
+    const uint8_t *extradata = NULL;
+    int extradata_size = 0;
+
+    if (csg_local_playback_get_audio_info(local_handle, &codec_id,
+                                      &sample_rate, &channels,
+                                      &channel_layout,
+                                      &extradata, &extradata_size) != 0) {
+        CSG_LOGI("MAIN", "No audio stream in file");
+        ctx->has_audio = 0;
+        return 0;
+    }
+
+    CSG_LOGI("MAIN", "Audio stream: codec=%d, %dHz/%dch, extradata=%d bytes",
+         codec_id, sample_rate, channels, extradata_size);
+
+    /* 创建音视频同步上下文 */
+    ctx->av_sync_handle = csg_av_sync_create();
+    if (!ctx->av_sync_handle) {
+        CSG_LOGE("MAIN", "Failed to create AV sync");
+        return -1;
+    }
+    csg_av_sync_set_master_clock(ctx->av_sync_handle, CSG_AV_CLOCK_MASTER_AUDIO);
+
+    /* 创建音频解码器 */
+    ctx->audio_dec_handle = csg_audio_decode_create(codec_id,
+                                                extradata, extradata_size,
+                                                sample_rate, channels,
+                                                channel_layout,
+                                                csg_player_on_audio_pcm, ctx);
+    if (!ctx->audio_dec_handle) {
+        CSG_LOGE("MAIN", "Failed to create audio decoder");
+        csg_av_sync_destroy(ctx->av_sync_handle);
+        ctx->av_sync_handle = NULL;
+        return -1;
+    }
+
+    /* 创建音频渲染器 (ALSA) */
+    int dst_rate = csg_audio_decode_get_target_rate(ctx->audio_dec_handle);
+    int dst_channels = csg_audio_decode_get_target_channels(ctx->audio_dec_handle);
+    ctx->audio_render_handle = csg_audio_render_create(dst_rate, dst_channels,
+                                                   16, "hw:1,0");
+    if (!ctx->audio_render_handle) {
+        CSG_LOGE("MAIN", "Failed to create audio renderer");
+        csg_audio_decode_destroy(ctx->audio_dec_handle);
+        ctx->audio_dec_handle = NULL;
+        csg_av_sync_destroy(ctx->av_sync_handle);
+        ctx->av_sync_handle = NULL;
+        return -1;
+    }
+
+    /* 启动音频渲染 */
+    if (csg_audio_render_start(ctx->audio_render_handle) != 0) {
+        CSG_LOGE("MAIN", "Failed to start audio renderer");
+        csg_audio_render_destroy(ctx->audio_render_handle);
+        ctx->audio_render_handle = NULL;
+        csg_audio_decode_destroy(ctx->audio_dec_handle);
+        ctx->audio_dec_handle = NULL;
+        csg_av_sync_destroy(ctx->av_sync_handle);
+        ctx->av_sync_handle = NULL;
+        return -1;
+    }
+
+    ctx->has_audio = 1;
+    CSG_LOGI("MAIN", "Audio pipeline ready: %dHz/%dch", dst_rate, dst_channels);
+    return 0;
+}
+
+static void csg_player_teardown_audio_pipeline(csg_player_app_ctx_t *ctx)
+{
+    if (ctx->audio_render_handle) {
+        csg_audio_render_stop(ctx->audio_render_handle);
+        csg_audio_render_destroy(ctx->audio_render_handle);
+        ctx->audio_render_handle = NULL;
+    }
+    if (ctx->audio_dec_handle) {
+        csg_audio_decode_destroy(ctx->audio_dec_handle);
+        ctx->audio_dec_handle = NULL;
+    }
+    if (ctx->av_sync_handle) {
+        csg_av_sync_destroy(ctx->av_sync_handle);
+        ctx->av_sync_handle = NULL;
+    }
+    ctx->has_audio = 0;
+}
+
+/* ==================== 本地视频帧回调 → MPP 解码 ==================== */
+static void csg_player_on_local_frame(void *data, int len, int is_keyframe,
+                           uint64_t pts, int codec_type, void *user_data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)user_data;
+    (void)codec_type;
+    if (!ctx->running) return;
+
+    if (ctx->state != CSG_PLAYER_STATE_PLAYING && ctx->state != CSG_PLAYER_STATE_PAUSED) {
+        return;
+    }
+
+    ctx->stats.recv_packets++;
+    ctx->stats.recv_bytes += len;
+
+    /* MPP reset 后等待关键帧才能恢复解码 */
+    if (ctx->mpp_needs_keyframe && !is_keyframe) {
+        ctx->stats.drop_frames++;
+        return;
+    }
+
+    if (ctx->mpp_handle) {
+        if (is_keyframe) {
+            ctx->last_keyframe_pts = (int64_t)pts;
+            if (ctx->mpp_needs_keyframe) {
+                ctx->mpp_needs_keyframe = 0;
+                ctx->mpp_kf_wait_decode = 1;
+                ctx->expected_kf_pts = (int64_t)pts;
+            }
+        }
+
+        /* 高倍速帧过滤: speed ≥ 8x 时只保留 I 关键帧, 丢弃 P/B 帧.
+         * 原因: MPP 解码器最大吞吐 ~182帧/秒, 14fps 视频 16x 需要
+         * 224帧/秒, 解码器无法跟上. 只解码 I 帧后, av_sync 通过
+         * frame_timer 缩放自动控制显示节奏, 实际倍速可达 16x+.
+         * 切回低倍速后 P/B 帧恢复正常解码, 不需额外处理. */
+        float spd = ctx->time_state.speed;
+        if (spd >= 8.0f && !is_keyframe) {
+            ctx->stats.drop_frames++;
+            if ((ctx->stats.drop_frames % 100) == 0) {
+                CSG_LOGI("MAIN", "Speed-filter: drop non-keyframe (speed=%.1fx, "
+                     "total_drop=%u)", spd, ctx->stats.drop_frames);
+            }
+            return;
+        }
+
+        csg_mpp_decode_send_frame(ctx->mpp_handle, data, len, is_keyframe, pts);
+    }
+}
+
+/* ==================== MPP 解码输出回调 ==================== */
+static void csg_player_on_mpp_frame(void *yuv_data, int yuv_len,
+                         int width, int height, int hor_stride, int ver_stride,
+                         uint64_t pts, int is_keyframe, void *user_data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)user_data;
+    (void)yuv_len;
+    if (!ctx->running) return;
+
+    /* 防竞争: 若回调到达时 MPP 已被切换到新的 (generation 不匹配), 丢弃 */
+    if (ctx->mpp_gen != ctx->state_gen) return;
+
+    /* 暂停: 不显示新帧, 画面保持暂停前最后一帧; 逐帧步进放行一帧 */
+    if (ctx->state == CSG_PLAYER_STATE_PAUSED) {
+        if (!ctx->step_frame_pending) return;
+        ctx->step_frame_pending = 0;
+        csg_lvgl_display_step_frame();
+    } else if (ctx->state != CSG_PLAYER_STATE_PLAYING) {
+        return;
+    }
+
+    /* Seek 后直接显示第一个解码帧 (不再等待 catchup 到目标 PTS).
+     * 精确匹配: mpp_kf_wait_decode=1 → 关键帧已送入, 首个输出帧即视为 DPB 重建完成 */
+    int was_post_resume_sync = ctx->post_resume_sync;
+    if (ctx->post_resume_sync) {
+        if (ctx->resume_min_pts > 0) {
+            /* 暂停恢复路径: 丢弃 pre-pause 残留帧 */
+            if ((int64_t)pts <= ctx->resume_min_pts) {
+                CSG_LOGI("MAIN", "sync-drop: pts=%llu <= min=%lld, discard",
+                     (unsigned long long)pts, (long long)ctx->resume_min_pts);
+                return;
+            }
+            CSG_LOGI("MAIN", "resume-sync: first valid frame pts=%llu (min=%lld)",
+                 (unsigned long long)pts, (long long)ctx->resume_min_pts);
+        } else {
+            /* Seek 路径: mpp_kf_wait_decode=0 → 关键帧尚未送入 MPP, 残留帧丢弃 */
+            if (!ctx->mpp_kf_wait_decode) {
+                CSG_LOGI("MAIN", "seek-discard: residual frame pts=%llu (kf not yet fed), drop",
+                     (unsigned long long)pts);
+                return;
+            }
+            /* ★ mpp_kf_wait_decode=1 → 关键帧已送入 MPP.
+             * 注意: 不能依赖 is_keyframe 判断! mpp_decode.c 中 pending_is_keyframe
+             * 是全局变量, 会被后续 send_frame() 覆盖, 导致关键帧被误报为 non-keyframe.
+             * 日志证据: "seek-drop: non-keyframe #1 pts=27966000" — 这恰是对齐关键帧 PTS.
+             *
+             * 修复: 用 PTS 范围判断新旧帧, 而非 is_keyframe 标志.
+             * 关键帧 PTS (audio_sync_base_pts) 是 Seek 对齐位置, 新帧 PTS 应在附近.
+             * 旧帧 PTS 差距 >10 秒 (如 103s → 28s 的回退 Seek), 直接丢弃. */
+            if (ctx->audio_sync_base_pts > 0) {
+                int64_t kf_pts = ctx->audio_sync_base_pts;
+                int64_t diff = (int64_t)pts - kf_pts;
+                if (diff < 0) diff = -diff;
+                if (diff > 10000000) {  /* >10 秒 → 旧帧 */
+                    ctx->seek_drop_count++;
+                    if (ctx->seek_drop_count <= 3) {
+                        CSG_LOGI("MAIN", "seek-drop: stale frame pts=%llu (kf_pts=%lld, diff=%lldus)",
+                             (unsigned long long)pts, (long long)kf_pts, (long long)diff);
+                    }
+                    if (ctx->seek_drop_count <= 50) {
+                        return;
+                    }
+                    CSG_LOGW("MAIN", "seek: %d stale frames dropped, forcing through",
+                         ctx->seek_drop_count);
+                }
+                /* PTS 在关键帧 10 秒内 → 新帧, 放行 */
+            }
+        }
+        ctx->post_resume_sync = 0;
+        ctx->resume_keyframe_seen = 0;
+        ctx->seek_target_pts = 0;
+        ctx->resume_min_pts = 0;
+        ctx->seek_drop_count = 0;
+        CSG_LOGI("MAIN", "sync: showing frame pts=%llu", (unsigned long long)pts);
+
+        if (ctx->mpp_kf_wait_decode) {
+            ctx->mpp_kf_wait_decode = 0;
+            ctx->mpp_needs_keyframe = 0;
+            ctx->expected_kf_pts = 0;
+
+            /* Seek 后有音频: 延迟解冻, 等待音频时钟真正开始推进后再显示.
+             * 否则视频解码远快于音频, 音频时钟卡在 base_pts 不动,
+             * 导致大量视频帧被 DROP -> 画面卡顿 + 音视频不同步. */
+            if (ctx->has_audio) {
+                ctx->waiting_audio_ready = 1;
+                ctx->audio_wait_frame_count = 0;
+                CSG_LOGI("MAIN", "Keyframe decoded OK, waiting for audio clock "
+                     "(base=%lld)...", (long long)ctx->audio_sync_base_pts);
+            } else {
+                csg_lvgl_display_set_paused(0);
+                ctx->seek_fast_feed_done = 1;
+                CSG_LOGI("MAIN", "Keyframe decoded OK, DPB rebuilt, display unfrozen");
+            }
+        }
+    } else if (ctx->mpp_kf_wait_decode) {
+        /* 非 post_resume_sync 但仍在等待关键帧解码 (如首帧启动场景) */
+        ctx->mpp_kf_wait_decode = 0;
+        ctx->mpp_needs_keyframe = 0;
+        ctx->expected_kf_pts = 0;
+        CSG_LOGI("MAIN", "Keyframe decoded OK (startup), DPB rebuilt");
+    }
+
+    ctx->stats.dec_frames++;
+
+    /* Seek 后音频就绪等待: 关键帧已解码但音频时钟尚未推进,
+     * 丢弃中间帧等待音频管线产出首帧 PCM 数据.
+     * 超时 15 帧后强制解冻, 防止音频卡死导致画面永久冻结.
+     *
+     * 解冻时若视频已大幅超前音频 (等待期间视频解码器持续输出),
+     * 将音频时钟快进到当前视频 PTS, 避免解冻后立即大量 DROP. */
+    if (ctx->waiting_audio_ready && ctx->audio_render_handle) {
+        int64_t audio_clock = csg_audio_render_get_clock(ctx->audio_render_handle);
+        ctx->audio_wait_frame_count++;
+
+        if (audio_clock > ctx->audio_sync_base_pts ||
+            ctx->audio_wait_frame_count > 15) {
+            ctx->waiting_audio_ready = 0;
+
+            /* 等待期间视频解码器持续输出, 视频 PTS 可能已远超音频时钟.
+             * 若 drift > 200ms, 将音频时钟快进到当前视频 PTS,
+             * 避免解冻后 AV-SYNC 立即触发大量 DROP 导致画面跳跃. */
+            int64_t current_pts = (int64_t)pts;
+            if (audio_clock > 0 && current_pts > audio_clock + 200000) {
+                CSG_LOGI("MAIN", "Audio clock skip: %lld -> %lld "
+                     "(drift was %+lldus, waited %d frames)",
+                     (long long)audio_clock, (long long)current_pts,
+                     (long long)(current_pts - audio_clock),
+                     ctx->audio_wait_frame_count);
+                csg_audio_render_adjust_clock(ctx->audio_render_handle, current_pts);
+                audio_clock = current_pts;
+            }
+
+            csg_lvgl_display_set_paused(0);
+            ctx->seek_fast_feed_done = 1;
+            CSG_LOGI("MAIN", "Audio ready: clock=%lld > base=%lld "
+                 "(waited %d frames)",
+                 (long long)audio_clock,
+                 (long long)ctx->audio_sync_base_pts,
+                 ctx->audio_wait_frame_count);
+        } else {
+            /* 音频未就绪, 丢弃帧等待 */
+            ctx->stats.drop_frames++;
+            return;
+        }
+    }
+
+    /* 音视频同步 */
+    if (ctx->has_audio && ctx->av_sync_handle && ctx->audio_render_handle) {
+        int64_t audio_clock = csg_audio_render_get_clock(ctx->audio_render_handle);
+        if (audio_clock > 0) {
+            csg_av_sync_set_audio_clock(ctx->av_sync_handle, audio_clock);
+        }
+
+        int64_t wait_us = 0;
+        csg_av_sync_action_t action = csg_av_sync_video_judge(ctx->av_sync_handle,
+                                                       (int64_t)pts, &wait_us);
+
+        int64_t drift = (int64_t)pts - audio_clock;
+
+        if (action != CSG_AV_SYNC_ACTION_DISPLAY) {
+            CSG_LOGI("MAIN", "AV-SYNC: action=%s pts=%lld audio=%lld drift=%+lldus",
+                 action == CSG_AV_SYNC_ACTION_DROP   ? "DROP"   :
+                 action == CSG_AV_SYNC_ACTION_WAIT   ? "WAIT"   :
+                 action == CSG_AV_SYNC_ACTION_REPEAT ? "REPEAT" : "?",
+                 (long long)pts, (long long)audio_clock, (long long)drift);
+        }
+
+        if (ctx->stats.dec_frames % 50 == 0) {
+            CSG_LOGI("MAIN", "AV-SYNC: pts=%lld audio=%lld drift=%+lldus",
+                 (long long)pts, (long long)audio_clock, (long long)drift);
+        }
+
+        switch (action) {
+        case CSG_AV_SYNC_ACTION_DROP:
+            /* 关键帧绝对不能丢: 丢 I 帧会导致后续所有 P 帧无法解码, 直接花屏.
+             * 改为 DISPLAY 强制显示, 宁可短暂不同步也不能丢关键帧. */
+            if (is_keyframe) {
+                CSG_LOGI("MAIN", "AV-SYNC: DROP blocked for keyframe pts=%lld", (long long)pts);
+                break;  /* 走 DISPLAY 路径 */
+            }
+            ctx->stats.drop_frames++;
+            usleep(50000);
+            return;
+        case CSG_AV_SYNC_ACTION_WAIT:
+            if (wait_us > 0 && wait_us <= 200000) {
+                usleep((unsigned int)wait_us);
+
+                /* ★ 等待后重新校验 drift: 防止过冲
+                 * 等待期间音频时钟持续推进, 若已追平或超过视频 PTS,
+                 * 记录过冲日志, 后续可据此微调 0.8 系数. */
+                int64_t audio_clock_after = csg_audio_render_get_clock(
+                    ctx->audio_render_handle);
+                if (audio_clock_after > 0) {
+                    int64_t drift_after = (int64_t)pts - audio_clock_after;
+                    if (drift_after < 0) {
+                        CSG_LOGI("MAIN", "AV-SYNC: over-shoot wait=%lldus "
+                             "drift_after=%+lldus",
+                             (long long)wait_us, (long long)drift_after);
+                    }
+                }
+            }
+            break;
+        case CSG_AV_SYNC_ACTION_REPEAT:
+            return;
+        case CSG_AV_SYNC_ACTION_DISPLAY:
+        default:
+            break;
+        }
+    } else if (ctx->stats.dec_frames % 50 == 0) {
+        CSG_LOGI("MAIN", "AV-SYNC: no audio (pts=%lld)", (long long)pts);
+    }
+
+    /* ★ 倍速下音频时钟钳制: 音频时钟以 speed × wall_time 推进,
+     * 但视频帧输出速率受限于 MPP 解码器实际吞吐量 (通常 1~2x),
+     * 导致 audio_clock 远超 video PTS → 全部帧 DROP → 画面卡死.
+     *
+     * 修复: 每显示一帧后将音频时钟钳制到当前帧 PTS,
+     * 使时钟始终跟随视频实际进度, 消除累积差距.
+     *
+     * 1x/2x 下不钳制, 保持正常同步精度. */
+    if (ctx->has_audio && ctx->audio_render_handle
+        && ctx->time_state.speed > 2.0f) {
+        csg_audio_render_adjust_clock(ctx->audio_render_handle, (int64_t)pts);
+    }
+
+    /* 进度采样 */
+    if (pts > 0) {
+        if (was_post_resume_sync) {
+            int64_t progress_pts;
+            if (ctx->resume_min_pts > 0) {
+                progress_pts = (int64_t)pts;
+            } else {
+                progress_pts = (ctx->last_keyframe_pts > 0)
+                                   ? ctx->last_keyframe_pts : (int64_t)pts;
+            }
+            ctx->time_state.ts = progress_pts;
+            csg_lvgl_control_update_progress_forced(progress_pts,
+                                                ctx->time_state.length,
+                                                ctx->time_state.live,
+                                                1);
+        } else {
+            ctx->time_state.ts = (int64_t)pts;
+            csg_lvgl_control_update_progress(ctx->time_state.ts,
+                                         ctx->time_state.length,
+                                         ctx->time_state.live);
+        }
+    }
+
+    if (ctx->stats.dec_frames <= 10 || ctx->stats.dec_frames % 50 == 0) {
+        CSG_LOGI("MAIN", "MPP out frame #%u %dx%d pts=%llu",
+             ctx->stats.dec_frames, width, height, (unsigned long long)pts);
+    }
+
+    /* 持久 RGB 缓冲区 + RGA 转换 */
+    int rgb_size;
+    int disp_w = width;
+    int disp_h = height;
+
+    if (ctx->is_local_play && ctx->video_width >= 3840) {
+        disp_w = 1920;
+        disp_h = 1080;
+        rgb_size = disp_w * disp_h * 4;
+    } else {
+        rgb_size = width * height * 4;
+    }
+
+    if (ctx->rgb_buf_size < rgb_size) {
+        free(ctx->rgb_buf);
+        ctx->rgb_buf = malloc(rgb_size);
+        ctx->rgb_buf_size = ctx->rgb_buf ? rgb_size : 0;
+    }
+    if (!ctx->rgb_buf) {
+        CSG_LOGE("MAIN", "RGB alloc failed: req=%d", rgb_size);
+        ctx->stats.drop_frames++;
+        return;
+    }
+
+    int ret = csg_rga_convert_nv12_to_rgb(yuv_data, width, height,
+                                      hor_stride, ver_stride,
+                                      ctx->rgb_buf, disp_w, disp_h,
+                                      RK_FORMAT_BGRA_8888);
+    if (ret == 0) {
+        if (csg_lvgl_display_is_ready()) {
+            csg_lvgl_display_update_video(ctx->rgb_buf, disp_w, disp_h);
+            ctx->stats.disp_frames++;
+            if (pts > 0 && ctx->state == CSG_PLAYER_STATE_PLAYING) {
+                ctx->last_displayed_pts = (int64_t)pts;
+            }
+            if (ctx->time_state.seeking) {
+                ctx->time_state.seeking = 0;
+            }
+        }
+    } else {
+        ctx->stats.drop_frames++;
+    }
+
+    /* 更新统计 */
+    struct timespec ts_now;
+    clock_gettime(CLOCK_MONOTONIC, &ts_now);
+    double elapsed = (ts_now.tv_sec - s_csg_player_stats_time.tv_sec) +
+                     (ts_now.tv_nsec - s_csg_player_stats_time.tv_nsec) / 1e9;
+    if (elapsed >= 1.0) {
+        uint32_t frames = ctx->stats.disp_frames;
+        uint64_t bytes = ctx->stats.recv_bytes;
+        ctx->stats.fps = (float)(frames / elapsed);
+        uint64_t raw_bitrate = (bytes * 8) / (uint64_t)elapsed;
+        ctx->stats.bitrate = (uint32_t)(raw_bitrate / 1000);
+        ctx->stats.disp_frames = 0;
+        ctx->stats.recv_bytes = 0;
+        clock_gettime(CLOCK_MONOTONIC, &s_csg_player_stats_time);
+        csg_lvgl_control_update_stats(&ctx->stats);
+    }
+}
+
+/* ==================== 本地播放事件回调 ==================== */
+static void csg_player_local_event_cb(csg_local_event_t event, void *user_data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)user_data;
+    if (!ctx) return;
+
+    switch (event) {
+    case CSG_LOCAL_EVENT_EOF:
+        CSG_LOGI("MAIN", "Local video EOF");
+        if (ctx->is_local_play) {
+            ctx->state = CSG_PLAYER_STATE_COMPLETED;
+            ctx->time_state.paused = 1;
+            ctx->time_state.pause_date = csg_player_now_us();
+            lv_async_call(csg_player_local_eof_ui_async, ctx);
+            CSG_LOGI("MAIN", "Entered COMPLETED state (resources preserved for seek)");
+        }
+        break;
+    case CSG_LOCAL_EVENT_SEEK_DONE:
+        CSG_LOGI("MAIN", "Local video seek done");
+        if (ctx->is_local_play && ctx->local_handle >= 0 && ctx->audio_render_handle) {
+            int64_t kf_pts = csg_local_playback_get_last_seek_kf_pts(ctx->local_handle);
+            if (kf_pts > 0) {
+                /* 修正音频时钟: 以视频关键帧实际 PTS 为基准,
+                 * 消除 target 与关键帧 PTS 的天然偏差,
+                 * 使音视频从同一位置起步. */
+                csg_audio_render_adjust_clock(ctx->audio_render_handle, kf_pts);
+                ctx->audio_seek_pts = kf_pts;
+                ctx->audio_sync_base_pts = kf_pts;
+                CSG_LOGI("MAIN", "Audio clock synced to keyframe PTS=%lldus", (long long)kf_pts);
+            }
+        }
+        break;
+    case CSG_LOCAL_EVENT_ERROR:
+        CSG_LOGE("MAIN", "Local video playback error");
+        if (ctx->is_local_play) {
+            ctx->is_local_play = 0;
+            ctx->state = CSG_PLAYER_STATE_IDLE;
+            if (ctx->local_handle >= 0) {
+                csg_local_playback_force_stop_thread(ctx->local_handle);
+            }
+            lv_async_call(csg_player_local_error_cleanup_async, ctx);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
+static void csg_player_local_eof_ui_async(void *data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)data;
+    if (!ctx) return;
+
+    csg_lvgl_display_set_paused(1);
+    csg_lvgl_control_set_paused_ui(1);
+    csg_lvgl_control_set_state(CSG_PLAYER_STATE_COMPLETED);
+    csg_lvgl_control_set_live(0);
+
+    int64_t last_pts = ctx->last_displayed_pts > 0
+                           ? ctx->last_displayed_pts
+                           : ctx->time_state.ts;
+    csg_lvgl_control_freeze_progress(last_pts);
+
+    csg_lvgl_control_local_eof();
+    CSG_LOGI("MAIN", "EOF UI async applied (COMPLETED state)");
+}
+
+static void csg_player_local_error_cleanup_async(void *data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)data;
+    if (!ctx) return;
+
+    CSG_LOGI("MAIN", "Async cleanup: playback error");
+    csg_lvgl_control_show_message("Playback error");
+
+    if (ctx->local_handle >= 0) {
+        csg_local_playback_cleanup_sync(ctx->local_handle);
+        ctx->local_handle = -1;
+    }
+    csg_player_teardown_audio_pipeline(ctx);
+    if (ctx->mpp_handle) {
+        csg_mpp_decode_stop(ctx->mpp_handle);
+        csg_mpp_decode_destroy(ctx->mpp_handle);
+        ctx->mpp_handle = NULL;
+    }
+    memset(&ctx->time_state, 0, sizeof(ctx->time_state));
+    ctx->time_state.rate = 1.0f;
+    ctx->time_state.speed = 1.0f;
+    ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+    ctx->time_state.system_date = csg_player_now_us();
+    ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+    ctx->step_frame_pending = 0;
+    ctx->live = 0;
+    ctx->is_local_play = 0;
+    csg_lvgl_display_set_paused(0);
+    csg_lvgl_control_set_live(0);
+    csg_lvgl_control_set_paused_ui(0);
+    ctx->state = CSG_PLAYER_STATE_IDLE;
+    csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+    memset(&ctx->stats, 0, sizeof(ctx->stats));
+}
+
+/* ==================== 播放器控制 ==================== */
+static void csg_player_pause(csg_player_app_ctx_t *ctx)
+{
+    if (ctx->state != CSG_PLAYER_STATE_PLAYING) return;
+
+    int64_t displayed_pts = ctx->last_displayed_pts;
+    int64_t decoded_pts = ctx->time_state.ts;
+    int64_t frozen_pts = (displayed_pts > 0) ? displayed_pts : decoded_pts;
+    CSG_LOGI("MAIN", "Pause: decoded_pts=%lld, displayed_pts=%lld, frozen_pts=%lld",
+         (long long)decoded_pts, (long long)displayed_pts, (long long)frozen_pts);
+
+    ctx->last_displayed_pts = frozen_pts;
+
+    int64_t now = csg_player_now_us();
+    ctx->time_state.paused = 1;
+    ctx->time_state.pause_date = now;
+    ctx->time_state.system_date = now;
+    ctx->time_state.ts = frozen_pts;
+
+    csg_lvgl_display_set_paused(1);
+
+    ctx->state = CSG_PLAYER_STATE_PAUSED;
+    csg_lvgl_control_set_paused_ui(1);
+    csg_lvgl_control_set_state(CSG_PLAYER_STATE_PAUSED);
+
+    if (ctx->is_local_play && ctx->local_handle >= 0) {
+        csg_local_playback_pause(ctx->local_handle);
+    }
+
+    if (ctx->audio_render_handle) {
+        csg_audio_render_pause(ctx->audio_render_handle);
+    }
+
+    ctx->resume_min_pts = frozen_pts;
+    csg_lvgl_control_freeze_progress(frozen_pts);
+
+    CSG_LOGI("MAIN", "Paused (DPB intact, no drain, resume_min=%lld)",
+         (long long)frozen_pts);
+}
+
+static void csg_player_resume(csg_player_app_ctx_t *ctx)
+{
+    if (ctx->state != CSG_PLAYER_STATE_PAUSED && ctx->state != CSG_PLAYER_STATE_COMPLETED) return;
+
+    int64_t resume_from_pos = -1;
+    if (ctx->state == CSG_PLAYER_STATE_COMPLETED) {
+        resume_from_pos = 0;
+        CSG_LOGI("MAIN", "Resume from COMPLETED: restart from beginning");
+    }
+
+    ctx->time_state.paused = 0;
+    ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+    ctx->time_state.system_date = csg_player_now_us();
+    ctx->time_state.ts = ctx->last_displayed_pts;
+
+    ctx->state = CSG_PLAYER_STATE_PLAYING;
+
+    if (ctx->is_local_play && ctx->local_handle >= 0) {
+        if (resume_from_pos == 0) {
+            if (ctx->mpp_handle) {
+                csg_mpp_decode_reset(ctx->mpp_handle);
+                ctx->mpp_needs_keyframe = 1;
+                ctx->mpp_kf_wait_decode = 0;
+            }
+            ctx->post_resume_sync = 0;
+            ctx->resume_keyframe_seen = 0;
+            csg_local_playback_seek(ctx->local_handle, 0.0);
+
+            if (ctx->audio_dec_handle) {
+                csg_audio_decode_reset(ctx->audio_dec_handle);
+            }
+            if (ctx->audio_render_handle) {
+                csg_audio_render_flush(ctx->audio_render_handle, 0);
+                csg_audio_render_resume(ctx->audio_render_handle);
+            }
+        } else {
+            ctx->post_resume_sync = 1;
+            ctx->seek_target_pts = 0;
+            ctx->resume_keyframe_seen = 0;
+            csg_local_playback_resume(ctx->local_handle, 0);
+            CSG_LOGI("MAIN", "Resume: post-resume-sync (filter pre-pause frames, min_pts=%lld)",
+                 (long long)ctx->resume_min_pts);
+
+            if (ctx->audio_render_handle) {
+                csg_audio_render_resume(ctx->audio_render_handle);
+            }
+        }
+    }
+
+    csg_lvgl_display_set_paused(0);
+    csg_lvgl_control_set_paused_ui(0);
+    csg_lvgl_control_set_state(CSG_PLAYER_STATE_PLAYING);
+    CSG_LOGI("MAIN", "Resumed (state=%d, last_disp=%lld)",
+         ctx->state, (long long)ctx->last_displayed_pts);
+}
+
+static void csg_player_step_frame(csg_player_app_ctx_t *ctx)
+{
+    if (ctx->state != CSG_PLAYER_STATE_PAUSED) return;
+    if (!ctx->mpp_handle) return;
+
+    ctx->step_frame_pending = 1;
+    CSG_LOGI("MAIN", "Step frame");
+}
+
+static void csg_player_seek(csg_player_app_ctx_t *ctx, double position)
+{
+    if (ctx->time_state.live) {
+        CSG_LOGI("MAIN", "Seek ignored (live stream)");
+        return;
+    }
+    if (position < 0.0) position = 0.0;
+    if (position > 1.0) position = 1.0;
+
+    int64_t target = (ctx->time_state.length > 0)
+                         ? (int64_t)(position * ctx->time_state.length) : 0;
+
+    CSG_LOGI("MAIN", "Seek to %.1f%% (t=%lldus)", position * 100.0,
+         (long long)target);
+
+    csg_lvgl_display_set_paused(1);
+    ctx->time_state.seeking = 1;
+    ctx->time_state.seek_pos = position;
+    ctx->time_state.seek_ts = target;
+    csg_lvgl_control_seek_instant(position, target);
+
+    /* ★ v3.1: post_resume_sync 和 audio_sync_base_pts 必须在 MPP reset 之前设置.
+     * 竞态窗口: MPP reset 期间, 回调线程可能仍在处理旧帧 (Reset 前已解码完成,
+     * 但回调尚未执行). 若 post_resume_sync=0, 旧帧被放行, 调用
+     * csg_lvgl_control_update_progress 清除 seeking 标志并更新进度为旧位置,
+     * 导致进度条"弹回"旧位置再跳回新位置.
+     *
+     * 提前设置后, 旧帧进入 post_resume_sync 块, 被 PTS 范围检查 (>10秒) 丢弃,
+     * 不会污染进度条状态. */
+    ctx->post_resume_sync = 1;
+    ctx->seek_target_pts = target;
+    ctx->resume_keyframe_seen = 0;
+    ctx->resume_min_pts = 0;
+    ctx->seek_drop_count = 0;
+    ctx->seek_fast_feed_done = 0;
+    ctx->waiting_audio_ready = 0;
+    ctx->audio_wait_frame_count = 0;
+    ctx->audio_seek_pts = target;
+    ctx->audio_sync_base_pts = target;
+
+    ctx->mpp_needs_keyframe = 1;
+    ctx->mpp_kf_wait_decode = 0;
+    ctx->expected_kf_pts = 0;
+    ctx->last_keyframe_pts = 0;
+    if (ctx->mpp_handle) {
+        csg_mpp_decode_reset(ctx->mpp_handle);
+
+        if (ctx->is_local_play && ctx->local_handle >= 0) {
+            const uint8_t *edata = NULL;
+            int esize = 0;
+            if (csg_local_playback_get_extradata(ctx->local_handle, &edata, &esize) == 0) {
+                csg_mpp_decode_set_extra_data(ctx->mpp_handle, edata, esize);
+            } else {
+                CSG_LOGW("MAIN", "Seek: no extradata to inject (raw stream, rely on in-band PS)");
+            }
+        }
+    }
+
+    if (ctx->audio_dec_handle) {
+        csg_audio_decode_reset(ctx->audio_dec_handle);
+    }
+    if (ctx->audio_render_handle) {
+        /* Seek 时音频时钟归零, 等待 SEEK_DONE 事件中用关键帧 PTS 修正.
+         * 不在此处预设 target, 因为 target 与视频关键帧 PTS 天然存在偏差,
+         * 导致音频时钟超前视频, 永远无法同步. */
+        csg_audio_render_flush(ctx->audio_render_handle, 0);
+        csg_audio_render_resume(ctx->audio_render_handle);
+    }
+
+    /* audio_seek_pts 在 SEEK_DONE 事件中设置, 以关键帧 PTS 为基准.
+     * 此处先设为 target 作为兜底, 防止极限情况下 SEEK_DONE 未触发. */
+    ctx->audio_seek_pts = target;
+    ctx->audio_sync_base_pts = target;
+
+    /* ★ Seek 后重置 frame_timer: 清除旧帧的节奏记忆,
+     * 否则新位置第一帧可能等待异常长的时间. */
+    if (ctx->av_sync_handle) {
+        csg_av_sync_reset_frame_timer(ctx->av_sync_handle);
+    }
+
+    if (ctx->state == CSG_PLAYER_STATE_COMPLETED) {
+        ctx->state = CSG_PLAYER_STATE_PLAYING;
+        ctx->time_state.paused = 0;
+        ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+        ctx->time_state.system_date = csg_player_now_us();
+        ctx->time_state.ts = target;
+        csg_lvgl_control_set_paused_ui(0);
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_PLAYING);
+        CSG_LOGI("MAIN", "Seek from COMPLETED: resumed PLAYING state");
+    }
+
+    if (ctx->is_local_play && ctx->local_handle >= 0) {
+        csg_local_playback_seek(ctx->local_handle, position);
+    }
+}
+
+static void csg_player_step(csg_player_app_ctx_t *ctx, int64_t delta_us)
+{
+    if (ctx->time_state.live) return;
+
+    int64_t cur = ctx->time_state.ts;
+    int64_t length = ctx->time_state.length;
+    if (length <= 0 || length == CSG_PLAYER_TICK_INVALID) return;
+
+    int64_t target = cur + delta_us;
+    if (target < 0) target = 0;
+    if (target > length) target = length;
+
+    double pos = (double)target / (double)length;
+    csg_player_seek(ctx, pos);
+}
+
+static void csg_player_set_speed(csg_player_app_ctx_t *ctx, float speed)
+{
+    if (speed < 0.5f || speed > 16.0f) return;
+    float old_speed = ctx->time_state.speed;
+    ctx->time_state.speed = speed;
+
+    int64_t now = csg_player_now_us();
+    int64_t drift_before = (now - ctx->time_state.system_date) * (int64_t)old_speed;
+    int64_t new_system_date = now - drift_before / (int64_t)speed;
+    ctx->time_state.system_date = new_system_date;
+
+    csg_lvgl_control_set_speed(speed);
+
+    if (ctx->av_sync_handle) {
+        csg_av_sync_set_speed(ctx->av_sync_handle, speed);
+    }
+
+    if (ctx->is_local_play && ctx->local_handle >= 0) {
+        csg_local_playback_set_speed(ctx->local_handle, speed);
+    }
+
+    /* ★ 同步更新音频渲染器的倍速因子, 使音频时钟以倍速推进.
+     * 缺失此调用会导致 2x 下音频时钟仍以 1x 推进,
+     * drift 线性增长到数秒. */
+    if (ctx->audio_render_handle) {
+        csg_audio_render_set_speed(ctx->audio_render_handle, speed);
+
+        /* ★ 从高倍速切回低倍速时, 音频时钟在高速下已严重超前视频 PTS,
+         * csg_audio_render_set_speed 保留旧 current_clock 作为新 base_pts,
+         * 导致切回 1x 后 audio_clock 比视频 PTS 大 48~60 秒 → 全部帧 DROP.
+         *
+         * 修复: 用当前视频帧 PTS 重置音频时钟, 消除累积差距.
+         * 注意: adjust_clock 必须在 set_speed 之后调用, 否则会被覆盖. */
+        if (old_speed > speed + 0.5f && ctx->last_displayed_pts > 0) {
+            csg_audio_render_adjust_clock(ctx->audio_render_handle,
+                                          ctx->last_displayed_pts);
+            CSG_LOGI("MAIN", "Speed down: audio clock clamped to video PTS=%lld",
+                 (long long)ctx->last_displayed_pts);
+        }
+    }
+
+    CSG_LOGI("MAIN", "Playback speed: %.2fx -> %.2fx", old_speed, speed);
+}
+
+/* ==================== 控制命令回调 ==================== */
+static void csg_player_on_control_cmd(csg_ctrl_cmd_t cmd, void *data, void *user_data)
+{
+    csg_player_app_ctx_t *ctx = (csg_player_app_ctx_t *)user_data;
+
+    switch (cmd) {
+    case CSG_CTRL_CMD_STOP_PREVIEW:
+        CSG_LOGI("MAIN", "Stopping playback...");
+        if (ctx->local_handle >= 0) {
+            csg_local_playback_stop(ctx->local_handle);
+            ctx->local_handle = -1;
+        }
+        if (ctx->mpp_handle) {
+            csg_mpp_decode_stop(ctx->mpp_handle);
+            csg_mpp_decode_destroy(ctx->mpp_handle);
+            ctx->mpp_handle = NULL;
+        }
+        csg_player_teardown_audio_pipeline(ctx);
+        memset(&ctx->time_state, 0, sizeof(ctx->time_state));
+        ctx->time_state.rate = 1.0f;
+        ctx->time_state.speed = 1.0f;
+        ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+        ctx->time_state.system_date = csg_player_now_us();
+        ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+        ctx->step_frame_pending = 0;
+        ctx->live = 0;
+        ctx->is_local_play = 0;
+        csg_lvgl_display_set_paused(0);
+        csg_lvgl_control_set_live(0);
+        csg_lvgl_control_set_paused_ui(0);
+        ctx->state = CSG_PLAYER_STATE_IDLE;
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+        memset(&ctx->stats, 0, sizeof(ctx->stats));
+        ctx->post_resume_sync = 0;
+        ctx->resume_keyframe_seen = 0;
+        ctx->resume_min_pts = 0;
+        ctx->last_keyframe_pts = 0;
+        break;
+
+    case CSG_CTRL_CMD_PAUSE:
+        csg_player_pause(ctx);
+        break;
+
+    case CSG_CTRL_CMD_RESUME:
+        csg_player_resume(ctx);
+        break;
+
+    case CSG_CTRL_CMD_TOGGLE_PAUSE:
+        if (ctx->state == CSG_PLAYER_STATE_PLAYING) {
+            csg_player_pause(ctx);
+        } else if (ctx->state == CSG_PLAYER_STATE_PAUSED || ctx->state == CSG_PLAYER_STATE_COMPLETED) {
+            csg_player_resume(ctx);
+        }
+        break;
+
+    case CSG_CTRL_CMD_SEEK_POSITION: {
+        double *pos = (double *)data;
+        if (pos) csg_player_seek(ctx, *pos);
+        break;
+    }
+
+    case CSG_CTRL_CMD_STEP_FORWARD:
+            csg_player_step(ctx, 30 * 1000000LL);
+            break;
+        case CSG_CTRL_CMD_STEP_BACKWARD:
+            csg_player_step(ctx, -30 * 1000000LL);
+            break;
+
+    case CSG_CTRL_CMD_NEXT_FRAME:
+        csg_player_step_frame(ctx);
+        break;
+
+    case CSG_CTRL_CMD_SHOW_CONTROLS:
+        csg_lvgl_control_show_bar();
+        break;
+
+    case CSG_CTRL_CMD_PLAY_LOCAL: {
+        const char *file_path = (const char *)data;
+        if (!file_path || file_path[0] == '\0') {
+            CSG_LOGW("MAIN", "Empty file path, ignore");
+            break;
+        }
+        CSG_LOGI("MAIN", "Playing local video: %s (old state=%d)", file_path, ctx->state);
+
+        ctx->state = CSG_PLAYER_STATE_IDLE;
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+
+        if (ctx->local_handle >= 0) {
+            csg_local_playback_cleanup_sync(ctx->local_handle);
+            ctx->local_handle = -1;
+        }
+        csg_player_teardown_audio_pipeline(ctx);
+        if (ctx->mpp_handle) {
+            csg_mpp_decode_stop(ctx->mpp_handle);
+            csg_mpp_decode_destroy(ctx->mpp_handle);
+            ctx->mpp_handle = NULL;
+        }
+        memset(&ctx->time_state, 0, sizeof(ctx->time_state));
+        ctx->time_state.rate = 1.0f;
+        ctx->time_state.speed = 1.0f;
+        ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+        ctx->time_state.system_date = csg_player_now_us();
+        ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+
+        /* ★ 新视频播放时重置 UI 倍速显示为 1x */
+        csg_lvgl_control_set_speed(1.0f);
+        ctx->step_frame_pending = 0;
+        ctx->live = 0;
+        ctx->post_resume_sync = 0;
+        ctx->resume_keyframe_seen = 0;
+        ctx->resume_min_pts = 0;
+        ctx->last_keyframe_pts = 0;
+        ctx->last_displayed_pts = 0;
+        ctx->mpp_needs_keyframe = 0;
+        ctx->mpp_kf_wait_decode = 0;
+
+        ctx->is_local_play = 1;
+        csg_lvgl_display_set_paused(0);
+        csg_lvgl_control_set_live(0);
+        csg_lvgl_control_set_paused_ui(0);
+        memset(&ctx->stats, 0, sizeof(ctx->stats));
+        clock_gettime(CLOCK_MONOTONIC, &s_csg_player_stats_time);
+
+        ctx->local_handle = csg_local_playback_create(file_path);
+        if (ctx->local_handle < 0) {
+            CSG_LOGE("MAIN", "Failed to create local playback: %s", file_path);
+            ctx->state = CSG_PLAYER_STATE_IDLE;
+            csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+            ctx->is_local_play = 0;
+            break;
+        }
+
+        csg_local_playback_set_event_callback(ctx->local_handle, csg_player_local_event_cb, ctx);
+        csg_local_playback_set_seek_feed_done_ptr(ctx->local_handle,
+                                              &ctx->seek_fast_feed_done);
+
+        csg_local_playback_get_video_info(ctx->local_handle,
+                                      &ctx->video_width, &ctx->video_height,
+                                      &ctx->video_fps, &ctx->codec_type);
+        /* ★ 启用 frame_timer 节奏控制器: 确保视频帧按音频时钟节奏等间隔显示 */
+        if (ctx->video_fps > 0 && ctx->av_sync_handle) {
+            csg_av_sync_set_frame_duration_by_fps(ctx->av_sync_handle,
+                                              (float)ctx->video_fps);
+        }
+        int64_t duration = csg_local_playback_get_duration(ctx->local_handle);
+        if (duration > 0) {
+            ctx->time_state.length = duration;
+            ctx->live = 0;
+            CSG_LOGI("MAIN", "Local video: %dx%d@%dfps, duration=%.1f sec",
+                 ctx->video_width, ctx->video_height, ctx->video_fps,
+                 (double)duration / 1000000.0);
+        } else {
+            ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+            ctx->live = 1;
+            CSG_LOGI("MAIN", "Local video: %dx%d@%dfps, unknown duration",
+                 ctx->video_width, ctx->video_height, ctx->video_fps);
+        }
+
+        ctx->mpp_handle = csg_mpp_decode_create(ctx->codec_type,
+                                            ctx->video_width,
+                                            ctx->video_height);
+        if (!ctx->mpp_handle) {
+            CSG_LOGE("MAIN", "Failed to create MPP decoder for local video");
+            csg_local_playback_stop(ctx->local_handle);
+            csg_local_playback_cleanup_sync(ctx->local_handle);
+            ctx->local_handle = -1;
+            ctx->state = CSG_PLAYER_STATE_IDLE;
+            csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+            ctx->is_local_play = 0;
+            break;
+        }
+
+        ctx->state_gen = csg_player_next_state_gen();
+        ctx->mpp_gen = ctx->state_gen;
+
+        ctx->state = CSG_PLAYER_STATE_PLAYING;
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_PLAYING);
+
+        csg_mpp_decode_set_callback(ctx->mpp_handle, csg_player_on_mpp_frame, ctx);
+        csg_local_playback_set_callback(ctx->local_handle, csg_player_on_local_frame, ctx);
+        csg_local_playback_set_audio_callback(ctx->local_handle, csg_player_on_audio_frame, ctx);
+
+        csg_player_setup_audio_pipeline(ctx, ctx->local_handle);
+
+        /* ★ 新视频播放时强制重置所有层的倍速为 1x.
+         * csg_lvgl_control_set_speed(1.0f) 只更新 UI 进度追踪,
+         * csg_player_set_speed 才同时更新 audio_render/av_sync/local_playback 三层. */
+        csg_player_set_speed(ctx, 1.0f);
+
+        csg_local_playback_start(ctx->local_handle);
+        break;
+    }
+
+    case CSG_CTRL_CMD_STOP_LOCAL: {
+        if (!ctx->is_local_play || ctx->local_handle < 0) {
+            CSG_LOGW("MAIN", "Not playing local video");
+            break;
+        }
+        CSG_LOGI("MAIN", "Stopping local playback...");
+        csg_local_playback_stop(ctx->local_handle);
+        ctx->local_handle = -1;
+
+        csg_player_teardown_audio_pipeline(ctx);
+
+        if (ctx->mpp_handle) {
+            csg_mpp_decode_stop(ctx->mpp_handle);
+            csg_mpp_decode_destroy(ctx->mpp_handle);
+            ctx->mpp_handle = NULL;
+        }
+        memset(&ctx->time_state, 0, sizeof(ctx->time_state));
+        ctx->time_state.rate = 1.0f;
+        ctx->time_state.speed = 1.0f;
+        ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+        ctx->time_state.system_date = csg_player_now_us();
+        ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+        ctx->step_frame_pending = 0;
+        ctx->live = 0;
+        ctx->is_local_play = 0;
+        ctx->post_resume_sync = 0;
+        ctx->resume_keyframe_seen = 0;
+        ctx->resume_min_pts = 0;
+        ctx->last_keyframe_pts = 0;
+        ctx->last_displayed_pts = 0;
+        ctx->mpp_needs_keyframe = 0;
+        ctx->mpp_kf_wait_decode = 0;
+        csg_lvgl_control_set_live(0);
+        csg_lvgl_control_set_paused_ui(0);
+        ctx->state = CSG_PLAYER_STATE_IDLE;
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+        memset(&ctx->stats, 0, sizeof(ctx->stats));
+        break;
+    }
+
+    case CSG_CTRL_CMD_LOCAL_BROWSE: {
+        CSG_LOGI("MAIN", "Scanning local video directory: %s", LOCAL_VIDEO_DIR);
+        csg_local_file_info_t files[64];
+        int count = csg_local_playback_scan_dir(LOCAL_VIDEO_DIR, files, 64);
+        if (count > 0) {
+            csg_lvgl_control_update_local_list(files, count);
+            csg_lvgl_control_show_local_browser(1);
+        } else {
+            CSG_LOGW("MAIN", "No video files found in %s", LOCAL_VIDEO_DIR);
+            csg_lvgl_control_show_message("No video files found");
+        }
+        break;
+    }
+
+    case CSG_CTRL_CMD_LOCAL_SELECT: {
+        const char *file_path = (const char *)data;
+        if (!file_path || file_path[0] == '\0') {
+            CSG_LOGW("MAIN", "Empty file path for local select");
+            break;
+        }
+        CSG_LOGI("MAIN", "Selected local file: %s (old state=%d)", file_path, ctx->state);
+        csg_lvgl_control_set_local_file_path(file_path);
+
+        ctx->state = CSG_PLAYER_STATE_IDLE;
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+
+        if (ctx->local_handle >= 0) {
+            csg_local_playback_cleanup_sync(ctx->local_handle);
+            ctx->local_handle = -1;
+        }
+        csg_player_teardown_audio_pipeline(ctx);
+        if (ctx->mpp_handle) {
+            csg_mpp_decode_stop(ctx->mpp_handle);
+            csg_mpp_decode_destroy(ctx->mpp_handle);
+            ctx->mpp_handle = NULL;
+        }
+        memset(&ctx->time_state, 0, sizeof(ctx->time_state));
+        ctx->time_state.rate = 1.0f;
+        ctx->time_state.speed = 1.0f;
+        ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+        ctx->time_state.system_date = csg_player_now_us();
+        ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+        ctx->step_frame_pending = 0;
+        ctx->live = 0;
+        ctx->post_resume_sync = 0;
+        ctx->resume_keyframe_seen = 0;
+        ctx->resume_min_pts = 0;
+        ctx->last_keyframe_pts = 0;
+        ctx->last_displayed_pts = 0;
+        ctx->mpp_needs_keyframe = 0;
+        ctx->mpp_kf_wait_decode = 0;
+
+        ctx->is_local_play = 1;
+        csg_lvgl_display_set_paused(0);
+        csg_lvgl_control_set_live(0);
+        csg_lvgl_control_set_paused_ui(0);
+        memset(&ctx->stats, 0, sizeof(ctx->stats));
+        clock_gettime(CLOCK_MONOTONIC, &s_csg_player_stats_time);
+
+        ctx->local_handle = csg_local_playback_create(file_path);
+        if (ctx->local_handle < 0) {
+            CSG_LOGE("MAIN", "Failed to create local playback: %s", file_path);
+            ctx->state = CSG_PLAYER_STATE_IDLE;
+            csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+            ctx->is_local_play = 0;
+            break;
+        }
+
+        csg_local_playback_set_event_callback(ctx->local_handle, csg_player_local_event_cb, ctx);
+        csg_local_playback_set_seek_feed_done_ptr(ctx->local_handle,
+                                              &ctx->seek_fast_feed_done);
+
+        csg_local_playback_get_video_info(ctx->local_handle,
+                                      &ctx->video_width, &ctx->video_height,
+                                      &ctx->video_fps, &ctx->codec_type);
+        /* ★ 启用 frame_timer 节奏控制器: 确保视频帧按音频时钟节奏等间隔显示 */
+        if (ctx->video_fps > 0 && ctx->av_sync_handle) {
+            csg_av_sync_set_frame_duration_by_fps(ctx->av_sync_handle,
+                                              (float)ctx->video_fps);
+        }
+        int64_t duration = csg_local_playback_get_duration(ctx->local_handle);
+        if (duration > 0) {
+            ctx->time_state.length = duration;
+            ctx->live = 0;
+        } else {
+            ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+            ctx->live = 1;
+        }
+
+        ctx->mpp_handle = csg_mpp_decode_create(ctx->codec_type,
+                                            ctx->video_width,
+                                            ctx->video_height);
+        if (!ctx->mpp_handle) {
+            CSG_LOGE("MAIN", "Failed to create MPP decoder for local video");
+            csg_local_playback_stop(ctx->local_handle);
+            csg_local_playback_cleanup_sync(ctx->local_handle);
+            ctx->local_handle = -1;
+            ctx->state = CSG_PLAYER_STATE_IDLE;
+            csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+            ctx->is_local_play = 0;
+            break;
+        }
+
+        ctx->state_gen = csg_player_next_state_gen();
+        ctx->mpp_gen = ctx->state_gen;
+
+        ctx->state = CSG_PLAYER_STATE_PLAYING;
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_PLAYING);
+
+        csg_mpp_decode_set_callback(ctx->mpp_handle, csg_player_on_mpp_frame, ctx);
+        csg_local_playback_set_callback(ctx->local_handle, csg_player_on_local_frame, ctx);
+        csg_local_playback_set_audio_callback(ctx->local_handle, csg_player_on_audio_frame, ctx);
+
+        csg_player_setup_audio_pipeline(ctx, ctx->local_handle);
+
+        /* ★ 新视频播放时强制重置所有层的倍速为 1x (同上) */
+        csg_player_set_speed(ctx, 1.0f);
+
+        csg_local_playback_start(ctx->local_handle);
+        csg_lvgl_control_show_local_browser(0);
+        break;
+    }
+
+    case CSG_CTRL_CMD_LOCAL_PAUSE: {
+        if (ctx->is_local_play && ctx->local_handle >= 0) {
+            if (ctx->state == CSG_PLAYER_STATE_PLAYING) {
+                csg_player_pause(ctx);
+            }
+            CSG_LOGI("MAIN", "Local video paused");
+        }
+        break;
+    }
+
+    case CSG_CTRL_CMD_LOCAL_RESUME: {
+        if (ctx->is_local_play && ctx->local_handle >= 0) {
+            if (ctx->state == CSG_PLAYER_STATE_PAUSED) {
+                csg_player_resume(ctx);
+            }
+            CSG_LOGI("MAIN", "Local video resumed");
+        }
+        break;
+    }
+
+    case CSG_CTRL_CMD_LOCAL_STOP: {
+        if (!ctx->is_local_play || ctx->local_handle < 0) {
+            CSG_LOGW("MAIN", "Not playing local video");
+            break;
+        }
+        CSG_LOGI("MAIN", "Stopping local playback (UI)...");
+        csg_local_playback_stop(ctx->local_handle);
+        ctx->local_handle = -1;
+
+        csg_player_teardown_audio_pipeline(ctx);
+
+        if (ctx->mpp_handle) {
+            csg_mpp_decode_stop(ctx->mpp_handle);
+            csg_mpp_decode_destroy(ctx->mpp_handle);
+            ctx->mpp_handle = NULL;
+        }
+        memset(&ctx->time_state, 0, sizeof(ctx->time_state));
+        ctx->time_state.rate = 1.0f;
+        ctx->time_state.speed = 1.0f;
+        ctx->time_state.length = CSG_PLAYER_TICK_INVALID;
+        ctx->time_state.system_date = csg_player_now_us();
+        ctx->time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+        ctx->step_frame_pending = 0;
+        ctx->live = 0;
+        ctx->is_local_play = 0;
+        csg_lvgl_display_set_paused(0);
+        csg_lvgl_control_set_live(0);
+        csg_lvgl_control_set_paused_ui(0);
+        ctx->state = CSG_PLAYER_STATE_IDLE;
+        csg_lvgl_control_set_state(CSG_PLAYER_STATE_IDLE);
+        memset(&ctx->stats, 0, sizeof(ctx->stats));
+        break;
+    }
+
+    case CSG_CTRL_CMD_QUIT:
+        ctx->running = 0;
+        break;
+
+    case CSG_CTRL_CMD_SPEED_SET: {
+        float *spd = (float *)data;
+        if (spd && *spd >= 0.5f && *spd <= 16.0f) {
+            csg_player_set_speed(ctx, *spd);
+        }
+        break;
+    }
+
+    default:
+        break;
+    }
+}
+
+/* ==================== 信号处理 ==================== */
+static void csg_player_signal_handler(int sig)
+{
+    CSG_LOGI("MAIN", "Signal %d received, exiting...", sig);
+    s_csg_player_app.running = 0;
+}
+
+/* ==================== 主函数 ==================== */
+int main(int argc, char *argv[])
+{
+    CSG_LOGI("MAIN", "=== RK3572 本地视频播放器 ===");
+    CSG_LOGI("MAIN", "Features: Local Playback + MPP Decode + RGA Convert + LVGL Display");
+
+    signal(SIGINT, csg_player_signal_handler);
+    signal(SIGTERM, csg_player_signal_handler);
+
+    s_csg_player_app.running = 1;
+    s_csg_player_app.state = CSG_PLAYER_STATE_IDLE;
+    s_csg_player_app.local_handle = -1;
+    s_csg_player_app.is_local_play = 0;
+    s_csg_player_app.has_audio = 0;
+    s_csg_player_app.av_sync_handle = NULL;
+    s_csg_player_app.audio_dec_handle = NULL;
+    s_csg_player_app.audio_render_handle = NULL;
+    pthread_mutex_init(&s_csg_player_app.mutex, NULL);
+    memset(&s_csg_player_app.stats, 0, sizeof(s_csg_player_app.stats));
+    memset(&s_csg_player_app.time_state, 0, sizeof(s_csg_player_app.time_state));
+    s_csg_player_app.time_state.rate = 1.0f;
+    s_csg_player_app.time_state.speed = 1.0f;
+    s_csg_player_app.time_state.length = CSG_PLAYER_TICK_INVALID;
+    s_csg_player_app.time_state.system_date = csg_player_now_us();
+    s_csg_player_app.time_state.pause_date = CSG_PLAYER_TICK_INVALID;
+
+    if (csg_rga_convert_init() != 0) {
+        CSG_LOGE("MAIN", "RGA init failed");
+        return -1;
+    }
+
+    if (csg_lvgl_display_init(0, 0) != 0) {
+        CSG_LOGE("MAIN", "LVGL display init failed");
+        csg_rga_convert_deinit();
+        return -1;
+    }
+
+    if (csg_lvgl_control_init(csg_player_on_control_cmd, &s_csg_player_app) != 0) {
+        CSG_LOGE("MAIN", "LVGL control init failed");
+        csg_lvgl_display_deinit();
+        csg_rga_convert_deinit();
+        return -1;
+    }
+
+    if (argc > 1) {
+        CSG_LOGI("MAIN", "Auto-starting local video: %s", argv[1]);
+        csg_player_on_control_cmd(CSG_CTRL_CMD_PLAY_LOCAL, argv[1], &s_csg_player_app);
+    }
+
+    CSG_LOGI("MAIN", "Entering main loop...");
+    while (s_csg_player_app.running) {
+        usleep(10000);
+    }
+
+    CSG_LOGI("MAIN", "Cleaning up...");
+
+    if (s_csg_player_app.local_handle >= 0) {
+        csg_local_playback_stop(s_csg_player_app.local_handle);
+    }
+    csg_player_teardown_audio_pipeline(&s_csg_player_app);
+    if (s_csg_player_app.mpp_handle) {
+        csg_mpp_decode_destroy(s_csg_player_app.mpp_handle);
+    }
+    if (s_csg_player_app.rgb_buf) {
+        free(s_csg_player_app.rgb_buf);
+        s_csg_player_app.rgb_buf = NULL;
+    }
+
+    csg_lvgl_control_deinit();
+    csg_lvgl_display_deinit();
+    csg_rga_convert_deinit();
+    pthread_mutex_destroy(&s_csg_player_app.mutex);
+
+    CSG_LOGI("MAIN", "=== Exit ===");
+    return 0;
+}

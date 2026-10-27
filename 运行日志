@@ -1,0 +1,346 @@
+root@ok3572-buildroot:/userdata/rk3572_player_release# ./run.sh
+[I][MAIN] === RK3572 本地视频播放器 ===
+[I][MAIN] Features: Local Playback + MPP Decode + RGA Convert + LVGL Display
+rga_api version 1.10.6_[3]
+[I][RGA] RGA version: RGA_api version       : v1.10.6_[3]
+RGA version           : RGA_2_PRO
+
+[I][RGA] init success
+[I][LVGL_DISP] DRM display: 2560x1440
+[W][EVDEV] No touchscreen found, UI buttons will not respond (use CLI args to start preview)
+[W][LVGL_DISP] Touch init failed
+[I][EVDEV] Mouse device: /dev/input/event5 (Instant USB Optical Mouse)
+[I][LVGL_DISP] Initialized successfully
+[I][LVGL_CTRL] Initialized
+[I][MAIN] Entering main loop...
+[I][MAIN] Background scan started: /userdata/records
+[I][LOCAL_PLAY] Recursive scan: 11 files from /userdata/records
+[I][MAIN] Background scan complete: 11 video files found
+[I][LVGL_CTRL] Scanning...
+[I][LOCAL_PLAY] Recursive scan: 11 files from /userdata/records
+[I][MAIN] Manual re-scan: 11 video files found
+[I][LVGL_CTRL] Updated local file list: 11 files
+[I][LVGL_CTRL] Selected local file: /userdata/records/20260901095352.mp4
+[I][MAIN] Selected local file: /userdata/records/20260901095352.mp4 (old state=0)
+[I][MAIN] LOCAL_SELECT step1: set_local_file_path
+[I][MAIN] LOCAL_SELECT step2: set_state IDLE
+[I][MAIN] LOCAL_SELECT step3: stop_demux_buffer
+[I][MAIN] LOCAL_SELECT step4: cleanup old local_handle=-1
+[I][MAIN] LOCAL_SELECT step5: teardown_audio_pipeline
+[I][MAIN] LOCAL_SELECT step6: create local_playback for /userdata/records/20260901095352.mp4
+[I][LOCAL_PLAY] Video track: 2560x1440 codec=H265
+[I][LOCAL_PLAY] Audio track: codec=1 8000Hz/1ch asc=2
+[I][LOCAL_PLAY] Duration: 120043000 us (120.0 sec)
+[I][LOCAL_PLAY] Created handle=0, file=/userdata/records/20260901095352.mp4
+[I][MAIN] LOCAL_SELECT step7: set callbacks + get info
+[I][LOCAL_PLAY] seek_fast_feed_done_ptr registered
+mpp[1458]: mpp_info: mpp version: unknown mpp version for missing VCS info
+[I][MPP_DEC] Set ENABLE_FAST_PLAY enabled (IDR output immediately)
+[I][MPP_DEC] Created: codec=H265, 2560x1440
+[I][MAIN] LOCAL_SELECT step8: MPP decoder created
+[I][MAIN] LOCAL_SELECT step9: start_demux_buffer
+[I][DEMUX_BUF] created (video: 64 frames/32 MB, audio: 256 frames/4096 KB)
+[I][MAIN] Demux buffer + dispatch threads started
+[I][MAIN] LOCAL_SELECT step10: set callbacks
+[I][MAIN] LOCAL_SELECT step11: setup_audio_pipeline
+[I][MAIN] Audio stream: codec=1, 8000Hz/1ch, extradata=2 bytes
+[I][AV_SYNC] Created (threshold=30000us, max_drop=5)
+[I][AV_SYNC] Master clock: AUDIO
+[I][AUDIO_DEC] Created (FAAD2): AAC native 16000Hz/2ch
+[I][AUDIO_RENDER] Created: device=hw:1,0, req=48000Hz → actual=48000Hz, 2ch/16bit
+[I][AUDIO_RENDER] Mixer init: card=1 (hw:1)
+[I][AUDIO_RENDER] Mixer: 108 controls on card 1
+[I][AUDIO_RENDER] Mixer ENUM: SAI1 Transmit Mono Switch[0] → Enable
+[I][AUDIO_RENDER] Mixer SW: SAI1 Clk Auto Switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer VOL: PCM Volume[0] → 165 (range 0~255, 65%)
+[I][AUDIO_RENDER] Mixer SW: DAC Limiter Switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer VOL: DAC Limiter Volume[0] → 7 (range 0~12, 65%)
+[I][AUDIO_RENDER] Mixer SW: Headphone ZC Switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: Headphone Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Headphone Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: Speaker ZC Switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: Speaker Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Speaker Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: AUXOUT Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: DAC 128x Oversampling Switch[0] OFF→ON
+[W][AUDIO_RENDER] Mixer SW: Headphone Jack[0] write failed: Operation not permitted
+[I][AUDIO_RENDER] Mixer SW: spk switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: hp switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: Headphone Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Speaker Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Left Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Right Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer LDAC Switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: AUX2 Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Left Input Mixer MicN Switch[0] ON→OFF (input-mix disabled)
+[I][AUDIO_RENDER] Mixer SW: Left Input Mixer MicP Switch[0] ON→OFF (input-mix disabled)
+[I][AUDIO_RENDER] Mixer SW: Right Input Mixer MicN Switch[0] ON→OFF (input-mix disabled)
+[I][AUDIO_RENDER] Mixer SW: Right Input Mixer MicP Switch[0] ON→OFF (input-mix disabled)
+[I][AUDIO_RENDER] Mixer done: 22 switches enabled, 4 volumes set
+[I][MAIN] Audio device: hw:1,0 (probe OK)
+[I][AUDIO_RENDER] Mixer init: card=1 (hw:1)
+[I][AUDIO_RENDER] Mixer: 108 controls on card 1
+[I][AUDIO_RENDER] Mixer ENUM: SAI1 Transmit Mono Switch[0] Enable (re-assert)
+[I][AUDIO_RENDER] Mixer SW: SAI1 Clk Auto Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: PCM Volume[0] → 165 (range 0~255, 65%)
+[I][AUDIO_RENDER] Mixer SW: DAC Limiter Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: DAC Limiter Volume[0] → 7 (range 0~12, 65%)
+[I][AUDIO_RENDER] Mixer SW: Headphone ZC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Headphone Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Headphone Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: Speaker ZC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Speaker Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Speaker Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: AUXOUT Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: DAC 128x Oversampling Switch[0] ON (re-assert)
+[W][AUDIO_RENDER] Mixer SW: Headphone Jack[0] write failed: Operation not permitted
+[I][AUDIO_RENDER] Mixer SW: spk switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: hp switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: Headphone Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Speaker Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Left Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Right Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX2 Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer done: 18 switches enabled, 4 volumes set
+[W][AUDIO_RENDER] GPIO assert: hp switch OFF→ON (round 0) but DAPM reverted to OFF immediately! (numid=80)
+[W][AUDIO_RENDER] GPIO assert: spk switch OFF→ON (round 0) but DAPM reverted to OFF immediately! (numid=79)
+[W][AUDIO_RENDER] GPIO assert: hp switch OFF→ON (round 1) but DAPM reverted to OFF immediately! (numid=80)
+[W][AUDIO_RENDER] GPIO assert: spk switch OFF→ON (round 1) but DAPM reverted to OFF immediately! (numid=79)
+[W][AUDIO_RENDER] GPIO assert: hp switch OFF→ON (round 2) but DAPM reverted to OFF immediately! (numid=80)
+[W][AUDIO_RENDER] GPIO assert: spk switch OFF→ON (round 2) but DAPM reverted to OFF immediately! (numid=79)
+[W][AUDIO_RENDER] GPIO assert: mixer control ineffective (hp=3/0 spk=3/0), trying GPIO sysfs fallback...
+[W][AUDIO_RENDER] GPIO sysfs: no exported GPIO found for NAU8822. Run 'diag_gpio.sh' to identify GPIO pins.
+[E][AUDIO_RENDER] GPIO assert: hp switch STILL OFF after 3 mixer writes + GPIO sysfs fallback! Audio output to headphone will be SILENT! (numid=80, check: amixer -c 1 cset numid=80 1)
+[E][AUDIO_RENDER] GPIO assert: spk switch STILL OFF after 3 mixer writes + GPIO sysfs fallback! Audio output to speaker will be SILENT! (numid=79, check: amixer -c 1 cset numid=79 1)
+[E][AUDIO_RENDER] === DIAGNOSTIC: GPIO output blocked ===
+[E][AUDIO_RENDER]   Possible causes:
+[E][AUDIO_RENDER]   1. Jack Detect: DAPM thinks no headphone plugged → run 'amixer -c 1 controls | grep -i jack'
+[E][AUDIO_RENDER]   2. DAPM path incomplete: check 'cat /sys/kernel/debug/asoc/*/dapm/*' if debugfs mounted
+[E][AUDIO_RENDER]   3. GPIO pin conflict: check 'cat /sys/kernel/debug/gpio | grep -i nau'
+[E][AUDIO_RENDER]   4. Run 'diag_gpio.sh' on target for full diagnostics
+[E][AUDIO_RENDER] === END DIAGNOSTIC ===
+[I][AUDIO_RENDER] Started
+[I][MAIN] Audio pipeline ready: AAC 8000Hz/1ch -> render 48kHz/2ch
+[I][MAIN] LOCAL_SELECT step12: set_speed + start
+[I][AUDIO_RENDER] Thread started
+[I][AV_SYNC] Speed: 1.00x (diff_ema + frame_timer reset)
+[I][LOCAL_PLAY] Speed changed: 1.00x
+[I][MAIN] Playback speed: 1.00x -> 1.00x
+[I][LOCAL_PLAY] Thread started: /userdata/records/20260901095352.mp4
+[I][MAIN] LOCAL_SELECT done: playing /userdata/records/20260901095352.mp4
+[I][LOCAL_PLAY] Rate calibration reset for new speed: 1.00x
+[I][MAIN] DIAG cb: len=25173 kf=1 pts=0 push=0
+[I][MAIN] DIAG dispatch: len=25173 kf=1 pts=0 state=3
+[I][MPP_DEC] DIAG send_frame: len=25173 kf=1 pts=0
+[I][MPP_DEC] keyframe #1 len=25173 pts=0
+[I][MPP_DEC] DIAG send_frame: len=8108 kf=0 pts=66000
+[I][MPP_DEC] DIAG send_frame: len=6367 kf=0 pts=143000
+[I][MPP_DEC] Info change: 2560x1440, stride=2560x1440, buf=6635520
+[I][MPP_DEC] DIAG send_frame: len=5387 kf=0 pts=223000
+[I][MAIN] MPP out frame #1 2560x1440 pts=0
+[I][MPP_DEC] output frame #1 2560x1440 pts=0 (raw=0)
+[I][LVGL_DISP] present frame #1 2560x1440
+[I][MAIN] MPP out frame #2 2560x1440 pts=66000
+[I][AV_SYNC] Frame duration: 71500us (13.99 fps) → frame_timer ENABLED
+[I][MAIN] Dynamic FPS: 14.0fps (avg_interval=71500us over 3 frames)
+[I][MAIN] MPP out frame #3 2560x1440 pts=143000
+[I][MAIN] MPP out frame #4 2560x1440 pts=223000
+[I][MAIN] MPP out frame #5 2560x1440 pts=264000
+[I][MPP_DEC] output frame #5 2560x1440 pts=264000 (raw=23760)
+[I][MAIN] MPP out frame #6 2560x1440 pts=343000
+[I][MAIN] MPP out frame #7 2560x1440 pts=423000
+[I][MAIN] MPP out frame #8 2560x1440 pts=464000
+[I][MAIN] MPP out frame #9 2560x1440 pts=543000
+[I][MAIN] MPP out frame #10 2560x1440 pts=623000
+[I][MPP_DEC] output frame #10 2560x1440 pts=623000 (raw=56070)
+[I][LVGL_DISP] present frame #5 2560x1440
+[I][AUDIO_RENDER] Clock init: base_pts=768000 (=audio first frame pts=768000, wall=47770112)
+[I][AUDIO_RENDER] CLOCK-DIAG: base_pts=768000 base_wall=47770112 delta=69355 raw=837355 delay=235500 cap=150000 clock=768000
+[I][MPP_DEC] output frame #15 2560x1440 pts=943000 (raw=84870)
+[I][AUDIO_RENDER] CLOCK-DIAG: base_pts=768000 base_wall=47770112 delta=230317 raw=998317 delay=68000 cap=126798 clock=871519
+[I][LVGL_DISP] present frame #10 2560x1440
+[I][MPP_DEC] output frame #20 2560x1440 pts=1264000 (raw=113760)
+[I][LVGL_DISP] present frame #15 2560x1440
+[I][MPP_DEC] output frame #25 2560x1440 pts=1623000 (raw=146070)
+[I][MAIN] DIAG dispatch: len=24761 kf=1 pts=2023000 state=3
+[I][MPP_DEC] keyframe #2 len=24761 pts=2023000
+[I][AUDIO_RENDER] CLOCK-DIAG: base_pts=768000 base_wall=47770112 delta=1233407 raw=2001407 delay=123500 cap=114175 clock=1887232
+[I][MPP_DEC] output frame #30 2560x1440 pts=1943000 (raw=174870)
+[I][LVGL_DISP] present frame #20 2560x1440
+[I][MPP_DEC] output frame #35 2560x1440 pts=2263000 (raw=203670)
+[I][LVGL_DISP] present frame #25 2560x1440
+[I][MPP_DEC] output frame #40 2560x1440 pts=2623000 (raw=236070)
+[I][LVGL_DISP] present frame #30 2560x1440
+[I][AUDIO_RENDER] CLOCK-DIAG: base_pts=768000 base_wall=47770112 delta=2283995 raw=3051995 delay=81000 cap=103029 clock=2948966
+[I][MPP_DEC] output frame #45 2560x1440 pts=2945000 (raw=265050)
+[I][LVGL_DISP] present frame #35 2560x1440
+[I][MAIN] AV-SYNC: pts=3264000 audio=3255764 drift=+8236us
+[I][MAIN] AV-SYNC show: pts=3264000 audible=3269242 resid=-5242us wait=8236
+[I][MPP_DEC] output frame #50 2560x1440 pts=3264000 (raw=293760)
+[I][MPP_DEC] output frame #55 2560x1440 pts=3624000 (raw=326160)
+[I][LVGL_DISP] present frame #40 2560x1440
+[I][MAIN] DIAG cb: len=21941 kf=1 pts=4024000 push=0
+[I][MAIN] DIAG dispatch: len=21941 kf=1 pts=4024000 state=3
+[I][MPP_DEC] keyframe #3 len=21941 pts=4024000
+[I][AUDIO_RENDER] CLOCK-DIAG: base_pts=768000 base_wall=47770112 delta=3290123 raw=4058123 delay=136166 cap=118212 clock=3939911
+[I][MPP_DEC] output frame #60 2560x1440 pts=3943000 (raw=354870)
+[I][LVGL_DISP] present frame #45 2560x1440
+[I][MPP_DEC] output frame #65 2560x1440 pts=4264000 (raw=383760)
+[I][LVGL_DISP] present frame #50 2560x1440
+[I][MPP_DEC] output frame #70 2560x1440 pts=4624000 (raw=416160)
+[I][AUDIO_RENDER] CLOCK-DIAG: base_pts=768000 base_wall=47770112 delta=4289430 raw=5057430 delay=139500 cap=117270 clock=4940160
+[I][LVGL_DISP] present frame #55 2560x1440
+[I][MPP_DEC] output frame #75 2560x1440 pts=4944000 (raw=444960)
+[I][MPP_DEC] output frame #80 2560x1440 pts=5264000 (raw=473760)
+[I][LVGL_DISP] present frame #60 2560x1440
+[I][MAIN] Pause: decoded_pts=5344000, displayed_pts=5344000, frozen_pts=5344000
+[I][LOCAL_PLAY] Paused
+[I][AUDIO_RENDER] Paused
+[I][MAIN] Paused (DPB intact, no drain, resume_min=5344000)
+[I][LOCAL_PLAY] Pause engaged (sample pos preserved)
+[I][LVGL_CTRL] Scanning...
+[I][LOCAL_PLAY] Recursive scan: 11 files from /userdata/records
+[I][MAIN] Manual re-scan: 11 video files found
+[I][LVGL_CTRL] Updated local file list: 11 files
+[I][MAIN] Stopping local playback (UI)...
+[I][LOCAL_PLAY] Marked stop handle=0 (async)
+[I][MAIN] Demux buffer + dispatch threads stopped
+[I][AUDIO_RENDER] Thread stopped
+[I][AUDIO_RENDER] Stopped
+[I][AUDIO_RENDER] SAIP DMA prepared (hardware reset OK)
+[I][LOCAL_PLAY] Thread stopped
+[I][AUDIO_RENDER] SAIP DMA hw_free OK
+[I][AUDIO_RENDER] SAIP DMA fully released (5-step reset sequence)
+[I][AUDIO_RENDER] Destroyed (underruns=0)
+[I][AUDIO_DEC] Destroyed (decoded 39 frames)
+[I][AV_SYNC] Destroyed
+[I][MPP_DEC] Stop done
+[I][MPP_DEC] Destroyed
+[I][LVGL_CTRL] Selected local file: /userdata/records/20260901095352.mp4
+[I][MAIN] Selected local file: /userdata/records/20260901095352.mp4 (old state=0)
+[I][MAIN] LOCAL_SELECT step1: set_local_file_path
+[I][MAIN] LOCAL_SELECT step2: set_state IDLE
+[I][MAIN] LOCAL_SELECT step3: stop_demux_buffer
+[I][MAIN] LOCAL_SELECT step4: cleanup old local_handle=-1
+[I][MAIN] LOCAL_SELECT step5: teardown_audio_pipeline
+[I][MAIN] LOCAL_SELECT step6: create local_playback for /userdata/records/20260901095352.mp4
+[I][LOCAL_PLAY] Reclaimed ctx slot=0 (sync)
+[I][LOCAL_PLAY] Video track: 2560x1440 codec=H265
+[I][LOCAL_PLAY] Audio track: codec=1 8000Hz/1ch asc=2
+[I][LOCAL_PLAY] Duration: 120043000 us (120.0 sec)
+[I][LOCAL_PLAY] Created handle=0, file=/userdata/records/20260901095352.mp4
+[I][MAIN] LOCAL_SELECT step7: set callbacks + get info
+[I][LOCAL_PLAY] seek_fast_feed_done_ptr registered
+mpp[1458]: mpp_info: mpp version: unknown mpp version for missing VCS info
+[I][MPP_DEC] Set ENABLE_FAST_PLAY enabled (IDR output immediately)
+[I][MPP_DEC] Created: codec=H265, 2560x1440
+[I][MAIN] LOCAL_SELECT step8: MPP decoder created
+[I][MAIN] LOCAL_SELECT step9: start_demux_buffer
+[I][DEMUX_BUF] created (video: 64 frames/32 MB, audio: 256 frames/4096 KB)
+[I][MAIN] Demux buffer + dispatch threads started
+[I][MAIN] LOCAL_SELECT step10: set callbacks
+[I][MAIN] LOCAL_SELECT step11: setup_audio_pipeline
+[I][MAIN] Audio stream: codec=1, 8000Hz/1ch, extradata=2 bytes
+[I][AV_SYNC] Created (threshold=30000us, max_drop=5)
+[I][AV_SYNC] Master clock: AUDIO
+[I][AUDIO_DEC] Created (FAAD2): AAC native 16000Hz/2ch
+[I][AUDIO_RENDER] Created: device=hw:1,0, req=48000Hz → actual=48000Hz, 2ch/16bit
+[I][AUDIO_RENDER] Mixer init: card=1 (hw:1)
+[I][AUDIO_RENDER] Mixer: 108 controls on card 1
+[I][AUDIO_RENDER] Mixer ENUM: SAI1 Transmit Mono Switch[0] Enable (re-assert)
+[I][AUDIO_RENDER] Mixer SW: SAI1 Clk Auto Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: PCM Volume[0] → 165 (range 0~255, 65%)
+[I][AUDIO_RENDER] Mixer SW: DAC Limiter Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: DAC Limiter Volume[0] → 7 (range 0~12, 65%)
+[I][AUDIO_RENDER] Mixer SW: Headphone ZC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Headphone Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Headphone Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: Speaker ZC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Speaker Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Speaker Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: AUXOUT Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: DAC 128x Oversampling Switch[0] ON (re-assert)
+[W][AUDIO_RENDER] Mixer SW: Headphone Jack[0] write failed: Operation not permitted
+[I][AUDIO_RENDER] Mixer SW: spk switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: hp switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: Headphone Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Speaker Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Left Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Right Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX2 Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer done: 18 switches enabled, 4 volumes set
+[I][MAIN] Audio device: hw:1,0 (probe OK)
+[I][AUDIO_RENDER] Mixer init: card=1 (hw:1)
+[I][AUDIO_RENDER] Mixer: 108 controls on card 1
+[I][AUDIO_RENDER] Mixer ENUM: SAI1 Transmit Mono Switch[0] Enable (re-assert)
+[I][AUDIO_RENDER] Mixer SW: SAI1 Clk Auto Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: PCM Volume[0] → 165 (range 0~255, 65%)
+[I][AUDIO_RENDER] Mixer SW: DAC Limiter Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: DAC Limiter Volume[0] → 7 (range 0~12, 65%)
+[I][AUDIO_RENDER] Mixer SW: Headphone ZC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Headphone Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Headphone Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: Speaker ZC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Speaker Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer VOL: Speaker Volume[0] → 40 (range 0~63, 65%)
+[I][AUDIO_RENDER] Mixer SW: AUXOUT Playback Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: DAC 128x Oversampling Switch[0] ON (re-assert)
+[W][AUDIO_RENDER] Mixer SW: Headphone Jack[0] write failed: Operation not permitted
+[I][AUDIO_RENDER] Mixer SW: spk switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: hp switch[0] OFF→ON
+[I][AUDIO_RENDER] Mixer SW: Headphone Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Speaker Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Left Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: Right Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer RDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX1 Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer SW: AUX2 Output Mixer LDAC Switch[0] ON (re-assert)
+[I][AUDIO_RENDER] Mixer done: 18 switches enabled, 4 volumes set
+[W][AUDIO_RENDER] GPIO assert: hp switch OFF→ON (round 0) but DAPM reverted to OFF immediately! (numid=80)
+[W][AUDIO_RENDER] GPIO assert: spk switch OFF→ON (round 0) but DAPM reverted to OFF immediately! (numid=79)
+[W][AUDIO_RENDER] GPIO assert: hp switch OFF→ON (round 1) but DAPM reverted to OFF immediately! (numid=80)
+[W][AUDIO_RENDER] GPIO assert: spk switch OFF→ON (round 1) but DAPM reverted to OFF immediately! (numid=79)
+[W][AUDIO_RENDER] GPIO assert: hp switch OFF→ON (round 2) but DAPM reverted to OFF immediately! (numid=80)
+[W][AUDIO_RENDER] GPIO assert: spk switch OFF→ON (round 2) but DAPM reverted to OFF immediately! (numid=79)
+[W][AUDIO_RENDER] GPIO assert: mixer control ineffective (hp=3/0 spk=3/0), trying GPIO sysfs fallback...
+[W][AUDIO_RENDER] GPIO sysfs: no exported GPIO found for NAU8822. Run 'diag_gpio.sh' to identify GPIO pins.
+[E][AUDIO_RENDER] GPIO assert: hp switch STILL OFF after 3 mixer writes + GPIO sysfs fallback! Audio output to headphone will be SILENT! (numid=80, check: amixer -c 1 cset numid=80 1)
+[E][AUDIO_RENDER] GPIO assert: spk switch STILL OFF after 3 mixer writes + GPIO sysfs fallback! Audio output to speaker will be SILENT! (numid=79, check: amixer -c 1 cset numid=79 1)
+[E][AUDIO_RENDER] === DIAGNOSTIC: GPIO output blocked ===
+[E][AUDIO_RENDER]   Possible causes:
+[E][AUDIO_RENDER]   1. Jack Detect: DAPM thinks no headphone plugged → run 'amixer -c 1 controls | grep -i jack'
+[E][AUDIO_RENDER]   2. DAPM path incomplete: check 'cat /sys/kernel/debug/asoc/*/dapm/*' if debugfs mounted
+[E][AUDIO_RENDER]   3. GPIO pin conflict: check 'cat /sys/kernel/debug/gpio | grep -i nau'
+[E][AUDIO_RENDER]   4. Run 'diag_gpio.sh' on target for full diagnostics
+[E][AUDIO_RENDER] === END DIAGNOSTIC ===
+[I][AUDIO_RENDER] Started
+[I][MAIN] Audio pipeline ready: AAC 8000Hz/1ch -> render 48kHz/2ch
+[I][AUDIO_RENDER] Thread started
+[I][MAIN] LOCAL_SELECT step12: set_speed + start
+[I][AV_SYNC] Speed: 1.00x (diff_ema + frame_timer reset)
+[I][LOCAL_PLAY] Speed changed: 1.00x
+[I][MAIN] Playback speed: 1.00x -> 1.00x
+[I][LOCAL_PLAY] Thread started: /userdata/records/20260901095352.mp4
+[I][LOCAL_PLAY] Rate calibration reset for new speed: 1.00x
+[I][MAIN] LOCAL_SELECT done: playing /userdata/records/20260901095352.mp4
+[I][MAIN] DIAG cb: len=25173 kf=1 pts=0 push=0
+[I][MAIN] DIAG dispatch: len=25173 kf=1 pts=0 state=3
+[I][MPP_DEC] DIAG send_frame: len=25173 kf=1 pts=0
+[I][MPP_DEC] keyframe #1 len=25173 pts=0
+[I][MPP_DEC] DIAG send_frame: len=8108 kf=0 pts=66000
+[I][MPP_DEC] DIAG send_frame: len=6367 kf=0 pts=143000
+[I][MPP_DEC] Info change: 2560x1440, stride=2560x1440, buf=6635520
+[I][MPP_DEC] DIAG send_frame: len=5387 kf=0 pts=223000
+[I][MAIN] MPP out frame #1 2560x1440 pts=0
+[I][MPP_DEC] output frame #1 2560x1440 pts=0 (raw=0)
+[I][MAIN] MPP out frame #2 2560x1440 pts=66000
+[I][AV_SYNC] Frame duration: 71500us (13.99 fps) → frame_timer ENABLED
+[I][MAIN] Dynamic FPS: 14.0fps (avg_interval=71500us over 3 frames)
+[I][MAIN] MPP out frame #3 2560x1440 pts=143000
+[I][MAIN] MPP out frame #4 2560x1440 pts=223000
+[I][MAIN] MPP out frame #5 2560x1440 pts=264000

@@ -1,0 +1,1271 @@
+/* SPDX-License-Identifier: MIT */
+/*
+ * audio_render.c - 音频渲染实现 (ALSA PCM)
+ *
+ * 参考:
+ *   VLC audio_output/dec.c  - stream_GetDelay() 音频时钟算法
+ *   NVR  board_hal_audio.c  - 嵌入式 ALSA PCM 播放
+ *
+ * 核心设计:
+ *   环形缓冲区 (FIFO):
+ *     - 每个 slot 包含 PCM 数据 + PTS + 采样数
+ *     - 读写索引用原子操作, 无锁设计
+ *   播放线程:
+ *     - 从环形缓冲取数据 → snd_pcm_writei
+ *     - 更新已播放采样数 → 用于计算音频时钟
+ *   音频时钟算法 (参考 VLC stream_GetDelay):
+ *     audio_clock = 基准PTS + (已播放采样数 / 采样率) * 1000000
+ */
+
+#include "audio_render.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <ctype.h>
+#include <time.h>
+#include <unistd.h>
+#include <pthread.h>
+
+#include <alsa/asoundlib.h>
+
+#define LOG_TAG "AUDIO_RENDER"
+#include "common.h"
+
+/* 环形缓冲区 slot 数
+ * 16 槽 × 100ms = 1.6s 缓冲, RK3572 嵌入式场景足够.
+ * 太大浪费内存 (每槽 4800×2ch×2bytes=19.2KB),
+ * 且倍速切换时剩余旧 PCM 数据过多, 影响时钟恢复速度. */
+#define RING_BUFFER_SLOTS  16
+
+/* 每个 slot 最大采样数 (48kHz × 100ms = 4800) */
+#define MAX_SAMPLES_PER_SLOT  4800
+
+/* ALSA period 大小 (帧数) */
+#define ALSA_PERIOD_SIZE    1024
+
+/* ALSA buffer 大小 (帧数) */
+#define ALSA_BUFFER_SIZE    4096
+
+/* 写超时 (ms) */
+#define ALSA_WRITE_TIMEOUT_MS  100
+
+/* 环形缓冲 slot */
+typedef struct {
+    int16_t  data[MAX_SAMPLES_PER_SLOT * 2];  /* S16LE 交错, 最大双声道 */
+    int      samples;      /* 采样数 (每通道) */
+    int64_t  pts;          /* 该帧的 PTS (微秒) */
+    int      valid;        /* 1=有效 */
+} csg_audio_render_ring_slot_t;
+
+struct csg_audio_render_ctx {
+    /* ALSA */
+    snd_pcm_t      *pcm;
+    char            device[64];
+    int             sample_rate;
+    int             channels;
+    int             bits_per_sample;
+    int             frame_bytes;      /* 每帧字节数 = channels * bits/8 */
+
+    /* 环形缓冲区 */
+    csg_audio_render_ring_slot_t        slots[RING_BUFFER_SLOTS];
+    volatile int    write_idx;        /* 生产者写入位置 */
+    volatile int    read_idx;         /* 消费者读取位置 */
+    pthread_mutex_t ring_mutex;
+
+    /* 播放线程 */
+    pthread_t       thread;
+    volatile int    running;
+    volatile int    playing;
+
+    /* 音频时钟 (墙上时钟插值, 不再依赖 snd_pcm_delay) */
+    int64_t         base_pts;         /* 当前播放段的基准 PTS */
+    int64_t         base_wall_us;     /* base_pts 对应的系统墙上时钟 */
+    int64_t         last_clock;       /* 上次返回的时钟值 (单调保证) */
+    int64_t         played_samples;   /* 已播放的累计采样数 */
+    int64_t         clock_ema;        /* 时钟 EMA 平滑值 (过滤锚点跳变) */
+    int             clock_ema_valid;  /* EMA 是否已初始化 */
+    unsigned int    clock_dbg_cnt;    /* CLOCK-DBG 限频计数 */
+    pthread_mutex_t clock_mutex;
+
+    /* ★ flush 代际计数器: flush 时递增, 音频线程检测变化后丢弃旧帧.
+     * 解决竞态: 音频线程在 flush 前读出了旧 PTS 帧, flush 后继续写完
+     * ALSA 并用旧 PTS 覆盖时钟, 导致 Seek 后时钟跳到上一个播放位置. */
+    volatile int    flush_gen;
+
+    /* ★ Seek 待处理标志: flush 时置 1, 音频线程首帧更新锚点后置 0.
+     * 解决: adjust_clock 将时钟设为视频 PTS (临时),
+     * 音频线程首帧将时钟校准为音频 PTS (永久),
+     * 消除视频 PTS 与音频 PTS 的容器偏移导致的唇音不同步. */
+    volatile int    seek_pending;
+
+    /* ★ 时钟初始化完成标志: 防止 PTS=0 时 base_pts<=0 条件重复触发.
+     * 问题: 音频首帧 PTS=0 → base_pts=0 → 0<=0 仍为真 → 第二帧
+     * 又初始化 → base_wall_us 被重置, 墙上时钟插值丢失时间差. */
+    volatile int    clock_init_done;
+
+    /* 倍速: 音频时钟推进速度因子 (默认 1.0) */
+    float           speed;
+
+    /* 音量 */
+    int             volume;           /* 0~100 */
+    int             muted;
+
+    /* 统计 */
+    int64_t         total_written;
+    int64_t         total_played;
+    int             underrun_count;
+};
+
+/* 前向声明: 混音器自动初始化 (定义在 create 之后) */
+static void csg_audio_render_init_mixer(csg_audio_render_ctx_t *ctx);
+
+/* ★ 不区分大小写子串匹配 (替代非 POSIX 的 strcasestr)
+ * 在 haystack 中搜索 needle 的子串, 忽略大小写.
+ * 返回首次匹配位置的指针, 或 NULL. */
+static const char *csg_stristr(const char *haystack, const char *needle)
+{
+    if (!haystack || !needle || !*needle) return NULL;
+    size_t nlen = strlen(needle);
+    for (const char *p = haystack; *p; p++) {
+        size_t i;
+        for (i = 0; i < nlen; i++) {
+            if (tolower((unsigned char)p[i]) != tolower((unsigned char)needle[i]))
+                break;
+        }
+        if (i == nlen) return p;
+    }
+    return NULL;
+}
+
+csg_audio_render_ctx_t *csg_audio_render_create(int sample_rate, int channels,
+                                      int bits_per_sample, const char *device)
+{
+    csg_audio_render_ctx_t *ctx = calloc(1, sizeof(csg_audio_render_ctx_t));
+    if (!ctx) return NULL;
+
+    ctx->sample_rate = sample_rate;
+    ctx->channels = channels;
+    ctx->bits_per_sample = bits_per_sample;
+    ctx->frame_bytes = channels * bits_per_sample / 8;
+    ctx->volume = 80;
+    ctx->muted = 0;
+    ctx->speed = 1.0f;
+
+    if (device && device[0]) {
+        strncpy(ctx->device, device, sizeof(ctx->device) - 1);
+    } else {
+        strcpy(ctx->device, "default");
+    }
+
+    pthread_mutex_init(&ctx->ring_mutex, NULL);
+    pthread_mutex_init(&ctx->clock_mutex, NULL);
+
+    /* 打开 ALSA PCM 设备 */
+    int ret = snd_pcm_open(&ctx->pcm, ctx->device,
+                           SND_PCM_STREAM_PLAYBACK, 0);
+    if (ret < 0) {
+        CSG_LOGE("AUDIO_RENDER", "snd_pcm_open(%s) failed: %s",
+             ctx->device, snd_strerror(ret));
+        goto fail;
+    }
+
+    /* 配置硬件参数 */
+    snd_pcm_hw_params_t *hw_params;
+    snd_pcm_hw_params_alloca(&hw_params);
+    snd_pcm_hw_params_any(ctx->pcm, hw_params);
+
+    snd_pcm_access_t access = SND_PCM_ACCESS_RW_INTERLEAVED;
+    snd_pcm_format_t format = (bits_per_sample == 16)
+                              ? SND_PCM_FORMAT_S16_LE
+                              : SND_PCM_FORMAT_S16_LE;
+
+    ret = snd_pcm_hw_params_set_access(ctx->pcm, hw_params, access);
+    if (ret < 0) goto hw_fail;
+
+    ret = snd_pcm_hw_params_set_format(ctx->pcm, hw_params, format);
+    if (ret < 0) goto hw_fail;
+
+    ret = snd_pcm_hw_params_set_channels(ctx->pcm, hw_params, channels);
+    if (ret < 0) goto hw_fail;
+
+    unsigned int rate = sample_rate;
+    int req_rate = sample_rate;
+    ret = snd_pcm_hw_params_set_rate_near(ctx->pcm, hw_params, &rate, 0);
+    if (ret < 0) goto hw_fail;
+
+    ret = snd_pcm_hw_params_set_period_size_near(ctx->pcm, hw_params,
+                                                  &(snd_pcm_uframes_t){ALSA_PERIOD_SIZE}, 0);
+    if (ret < 0) goto hw_fail;
+
+    ret = snd_pcm_hw_params_set_buffer_size_near(ctx->pcm, hw_params,
+                                                  &(snd_pcm_uframes_t){ALSA_BUFFER_SIZE});
+    if (ret < 0) goto hw_fail;
+
+    ret = snd_pcm_hw_params(ctx->pcm, hw_params);
+    if (ret < 0) {
+hw_fail:
+        CSG_LOGE("AUDIO_RENDER", "HW params failed: %s", snd_strerror(ret));
+        snd_pcm_close(ctx->pcm);
+        ctx->pcm = NULL;
+        goto fail;
+    }
+
+    /* 从硬件读回实际生效的采样率 (避免 set_rate_near 协商后不一致) */
+    unsigned int actual_rate = 0;
+    ret = snd_pcm_hw_params_get_rate(hw_params, &actual_rate, 0);
+    if (ret < 0) {
+        actual_rate = rate;  /* 降级: 用 set_rate_near 返回的值 */
+    }
+    ctx->sample_rate = (int)actual_rate;
+
+    CSG_LOGI("AUDIO_RENDER", "Created: device=%s, req=%dHz → actual=%uHz, %dch/%dbit",
+         ctx->device, req_rate, actual_rate, channels, bits_per_sample);
+    if (actual_rate != (unsigned int)req_rate) {
+        CSG_LOGW("AUDIO_RENDER", "Sample rate mismatch! req=%dHz, actual=%uHz, "
+             "clock may drift %+.1f%%",
+             req_rate, actual_rate,
+             (double)((int)actual_rate - req_rate) / req_rate * 100.0);
+    }
+
+    /* 配置软件参数 */
+    snd_pcm_sw_params_t *sw_params;
+    snd_pcm_sw_params_alloca(&sw_params);
+    snd_pcm_sw_params_current(ctx->pcm, sw_params);
+
+    ret = snd_pcm_sw_params_set_start_threshold(ctx->pcm, sw_params,
+                                                ALSA_BUFFER_SIZE / 2);
+    if (ret < 0) {
+        CSG_LOGW("AUDIO_RENDER", "sw_params start_threshold failed: %s",
+             snd_strerror(ret));
+    }
+
+    ret = snd_pcm_sw_params(ctx->pcm, sw_params);
+    if (ret < 0) {
+        CSG_LOGW("AUDIO_RENDER", "sw_params failed: %s", snd_strerror(ret));
+    }
+
+    /* 自动初始化混音器, 使能耳机/喇叭输出路径 */
+    csg_audio_render_init_mixer(ctx);
+
+    return ctx;
+
+fail:
+    pthread_mutex_destroy(&ctx->ring_mutex);
+    pthread_mutex_destroy(&ctx->clock_mutex);
+    free(ctx);
+    return NULL;
+}
+
+/* ==================== 混音器自动初始化 ====================
+ * RK3572 + NAU8822: 上电后默认所有输出路径静音/关闭,
+ * 必须通过 amixer 使能才能听到声音. 此函数自动完成配置,
+ * 避免每次手动运行 amixer 命令.
+ *
+ * ★ 两层处理:
+ *   第1层: 使能输出开关 (Headphone/Speaker Switch, ZC, DAC 等)
+ *   第2层: 设置输出音量 (Headphone/Speaker Playback Volume)
+ *   旧方案只处理开关, 音量默认 0 导致无声.
+ *
+ * 支持的控件 (按实际 DTS 命名):
+ *   Headphone / Headphone Switch → 耳机输出总开关
+ *   hp switch                    → 耳机 GPIO 开关
+ *   Speaker / Speaker Switch     → 喇叭输出总开关
+ *   spk switch                   → 喇叭 GPIO 开关
+ *   Headphone ZC                 → 耳机零交叉 (防爆音)
+ *   Speaker ZC                   → 喇叭零交叉 (防爆音)
+ *   DAC 128x Oversampling        → DAC 过采样 (提升音质)
+ *   Headphone Playback Volume    → 耳机音量 (关键!)
+ *   Speaker Playback Volume      → 喇叭音量 (关键!)
+ *   Master Playback Volume       → 主音量 (兜底)
+ *   PCM Playback Volume          → PCM 音量 (兜底)
+ *
+ * 策略: 遍历所有控件, 子串不区分大小写匹配.
+ * 不存在的控件静默跳过, 兼容不同板卡配置. */
+static void csg_audio_render_init_mixer(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx || !ctx->device[0]) return;
+
+    /* 从设备名解析声卡号: "hw:1,0" → card=1, "hw:0,0" → card=0 */
+    int card = 0;
+    const char *p = strchr(ctx->device, ':');
+    if (p) {
+        card = atoi(p + 1);
+    }
+    /* "default" 设备无法解析, card 保持 0 (通常是正确的) */
+
+    snd_ctl_t *ctl = NULL;
+    char ctl_name[32];
+    snprintf(ctl_name, sizeof(ctl_name), "hw:%d", card);
+
+    int ret = snd_ctl_open(&ctl, ctl_name, 0);
+    if (ret < 0) {
+        CSG_LOGW("AUDIO_RENDER", "snd_ctl_open(%s) failed: %s, "
+             "mixer auto-config skipped", ctl_name, snd_strerror(ret));
+        return;
+    }
+
+    CSG_LOGI("AUDIO_RENDER", "Mixer init: card=%d (%s)", card, ctl_name);
+
+    /* ---- 第1层: 输出使能开关 (不区分大小写子串匹配) ----
+     * 覆盖 NAU8822 全部模拟输出路径:
+     *   Headphone/Speaker Switch → 总开关
+     *   Headphone/Speaker Playback Switch → 播放开关
+     *   hp/spk switch → GPIO 开关
+     *   Headphone/Speaker ZC → 零交叉防爆音
+     *   DAC 128x Oversampling → 提升音质
+     *   Output Mixer LDAC/RDAC → DAC 到输出混音器
+     *   Clk Auto → SAI 时钟自动开关 (重要!)
+     *   AUXOUT Playback → 辅助输出
+     *   DAC Limiter → DAC 限幅器 */
+    static const char *s_enable_keys[] = {
+        "headphone switch",       /* 耳机总开关 (numid=81) */
+        "headphone playback",     /* 耳机播放开关 (numid=65) */
+        "hp switch",              /* 耳机 GPIO 开关 (numid=80) */
+        "speaker switch",         /* 喇叭总开关 (numid=82) */
+        "speaker playback",       /* 喇叭播放开关 (numid=68) */
+        "spk switch",             /* 喇叭 GPIO 开关 (numid=79) */
+        "headphone zc",           /* 耳机零交叉防爆音 (numid=64) */
+        "speaker zc",             /* 喇叭零交叉防爆音 (numid=67) */
+        "dac 128x oversampling",  /* DAC 过采样 (numid=74) */
+        "dac oversampling",       /* 兜底 */
+        "output mixer ldac",      /* 左声道DAC→输出混音器 (numid=87) */
+        "output mixer rdac",      /* 右声道DAC→输出混音器 (numid=91) */
+        "clk auto",               /* SAI时钟自动 (numid=34, 关键!) */
+        "auxout playback",        /* 辅助输出播放 (numid=70) */
+        "dac limiter switch",     /* DAC限幅器 (numid=47) */
+        "dac playback",           /* DAC 播放使能 (兜底) */
+        "playback switch",        /* 播放总开关 (兜底) */
+        "pcm playback",           /* PCM 播放开关 (兜底) */
+        "dac switch",             /* DAC 开关 (兜底) */
+        "playback deemphasis",    /* 去加重 (兜底) */
+        NULL
+    };
+
+    /* ★ 显式强制关闭的控件: 输入混音类开关 (Left/Right Input Mixer L2/R2、
+     *   Output Mixer LINMIX/RINMIX、AUX 混音等) 会把 LINE_IN/MIC 等外部
+     *   输入信号混入 DAC 输出, 导致播放器能听到"现场回音"而不是视频原声.
+     *   历史踩坑: 宽松子串匹配 "input mixer"/"output mixer linmix" 误把
+     *   输入混音当输出使能打开, 板端出现明显回声. 这里显式 OFF 兜底. */
+    static const char *s_disable_keys[] = {
+        "input mixer",            /* 输入混音器总开关 */
+        "output mixer linmix",    /* 左输入→输出混音 */
+        "output mixer rinmix",    /* 右输入→输出混音 */
+        "aux1 output mixer",      /* AUX1 输出混音器 (含输入混音路径) */
+        "aux2 output mixer",      /* AUX2 输出混音器 (含输入混音路径) */
+        NULL
+    };
+
+    /* ---- 第1.5层: ENUMERATED 枚举型开关 (非布尔型, 需特殊处理) ----
+     * SAI1 Transmit Mono Switch: 使能 SAI 发送通道, 否则 PCM 数据
+     * 无法从 CPU 传输到 NAU8822 编解码器. */
+    static const char *s_enum_keys[] = {
+        "transmit mono",           /* SAI1 Transmit Mono Switch (numid=7) */
+        NULL
+    };
+
+    /* ---- 第2层: 输出音量控件 (设为最大值的 80%) ---- */
+    static const char *s_volume_keys[] = {
+        "headphone volume",        /* 耳机音量 (numid=66, 最优先) */
+        "speaker volume",          /* 喇叭音量 (numid=69) */
+        "pcm volume",              /* PCM 数字音量 (numid=42) */
+        "dac limiter volume",      /* DAC 限幅器音量 (numid=51) */
+        "master playback volume",  /* 主音量 (兜底) */
+        "master volume",           /* 简化命名 (兜底) */
+        NULL
+    };
+
+    int switch_count = 0;
+    int volume_count = 0;
+
+    /* 遍历混音器所有控件 (NAU8822 约 100 个, 200 足够) */
+    snd_ctl_elem_list_t *elist;
+    snd_ctl_elem_list_alloca(&elist);
+    snd_ctl_elem_list_alloc_space(elist, 200);
+
+    ret = snd_ctl_elem_list(ctl, elist);
+    if (ret < 0) {
+        CSG_LOGW("AUDIO_RENDER", "snd_ctl_elem_list failed: %s", snd_strerror(ret));
+        snd_ctl_close(ctl);
+        return;
+    }
+
+    unsigned int count = snd_ctl_elem_list_get_count(elist);
+    CSG_LOGI("AUDIO_RENDER", "Mixer: %u controls on card %d", count, card);
+
+    for (unsigned int i = 0; i < count; i++) {
+        snd_ctl_elem_id_t *eid;
+        snd_ctl_elem_id_alloca(&eid);
+        snd_ctl_elem_list_get_id(elist, i, eid);
+
+        const char *name = snd_ctl_elem_id_get_name(eid);
+        unsigned int idx = snd_ctl_elem_id_get_index(eid);
+
+        /* 获取控件类型 */
+        snd_ctl_elem_info_t *info;
+        snd_ctl_elem_info_alloca(&info);
+        snd_ctl_elem_info_set_id(info, eid);
+        ret = snd_ctl_elem_info(ctl, info);
+        if (ret < 0) continue;
+
+        snd_ctl_elem_type_t etype = snd_ctl_elem_info_get_type(info);
+
+        /* ---- 第1层: 布尔型开关 ---- */
+        if (etype == SND_CTL_ELEM_TYPE_BOOLEAN) {
+            /* ★ 先检查是否在禁用列表: 输入混音类开关显式强制 OFF,
+             *   防止宽松子串匹配误把输入混音当输出使能打开导致回音. */
+            int is_disable = 0;
+            for (int k = 0; s_disable_keys[k]; k++) {
+                if (csg_stristr(name, s_disable_keys[k])) {
+                    is_disable = 1;
+                    break;
+                }
+            }
+            if (is_disable) {
+                snd_ctl_elem_value_t *val;
+                snd_ctl_elem_value_alloca(&val);
+                snd_ctl_elem_value_set_id(val, eid);
+                ret = snd_ctl_elem_read(ctl, val);
+                if (ret < 0) continue;
+                long cur = snd_ctl_elem_value_get_boolean(val, idx);
+                if (cur != 0) {
+                    snd_ctl_elem_value_set_boolean(val, idx, 0);
+                    ret = snd_ctl_elem_write(ctl, val);
+                    if (ret >= 0) {
+                        CSG_LOGI("AUDIO_RENDER", "Mixer SW: %s[%u] ON→OFF "
+                             "(input-mix disabled)", name, idx);
+                        switch_count++;
+                    }
+                }
+                continue;
+            }
+
+            /* 不区分大小写子串匹配 */
+            int found = 0;
+            for (int k = 0; s_enable_keys[k]; k++) {
+                if (csg_stristr(name, s_enable_keys[k])) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) continue;
+
+            snd_ctl_elem_value_t *val;
+            snd_ctl_elem_value_alloca(&val);
+            snd_ctl_elem_value_set_id(val, eid);
+            ret = snd_ctl_elem_read(ctl, val);
+            if (ret < 0) continue;
+
+            long cur = snd_ctl_elem_value_get_boolean(val, idx);
+            if (cur == 0) {
+                snd_ctl_elem_value_set_boolean(val, idx, 1);
+                ret = snd_ctl_elem_write(ctl, val);
+                if (ret >= 0) {
+                    CSG_LOGI("AUDIO_RENDER", "Mixer SW: %s[%u] OFF→ON", name, idx);
+                    switch_count++;
+                } else {
+                    CSG_LOGW("AUDIO_RENDER", "Mixer SW: %s[%u] write failed: %s",
+                         name, idx, snd_strerror(ret));
+                }
+            }
+            continue;
+        }
+
+        /* ---- 第1.5层: 枚举型开关 (SAI1 Transmit Mono 等) ----
+         * ENUMERATED 类型不是布尔型, 需要用 snd_ctl_elem_value_get_enumerated.
+         * 匹配到关键字后, 查找 "Enable" 或 "On" 选项并设置. */
+        if (etype == SND_CTL_ELEM_TYPE_ENUMERATED) {
+            int found = 0;
+            for (int k = 0; s_enum_keys[k]; k++) {
+                if (csg_stristr(name, s_enum_keys[k])) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) continue;
+
+            unsigned int items = snd_ctl_elem_info_get_items(info);
+            int enable_idx = -1;
+
+            /* 遍历所有枚举项, 查找 "Enable" 或 "On" */
+            for (unsigned int item = 0; item < items; item++) {
+                snd_ctl_elem_info_set_item(info, item);
+                ret = snd_ctl_elem_info(ctl, info);
+                if (ret < 0) continue;
+                const char *item_name = snd_ctl_elem_info_get_item_name(info);
+                if (!item_name) continue;
+                if (strcasecmp(item_name, "Enable") == 0 ||
+                    strcasecmp(item_name, "On") == 0) {
+                    enable_idx = (int)item;
+                    break;
+                }
+            }
+
+            if (enable_idx < 0) {
+                CSG_LOGI("AUDIO_RENDER", "Mixer ENUM: %s[%u] no 'Enable' option, skip",
+                     name, idx);
+                continue;
+            }
+
+            snd_ctl_elem_value_t *val;
+            snd_ctl_elem_value_alloca(&val);
+            snd_ctl_elem_value_set_id(val, eid);
+            ret = snd_ctl_elem_read(ctl, val);
+            if (ret < 0) continue;
+
+            long cur = snd_ctl_elem_value_get_enumerated(val, idx);
+            if (cur != enable_idx) {
+                snd_ctl_elem_value_set_enumerated(val, idx, enable_idx);
+                ret = snd_ctl_elem_write(ctl, val);
+                if (ret >= 0) {
+                    CSG_LOGI("AUDIO_RENDER", "Mixer ENUM: %s[%u] → Enable",
+                         name, idx);
+                    switch_count++;
+                } else {
+                    CSG_LOGW("AUDIO_RENDER", "Mixer ENUM: %s[%u] write failed: %s",
+                         name, idx, snd_strerror(ret));
+                }
+            }
+            continue;
+        }
+
+        /* ---- 第2层: 整数型音量 ---- */
+        if (etype == SND_CTL_ELEM_TYPE_INTEGER) {
+            int found = 0;
+            for (int k = 0; s_volume_keys[k]; k++) {
+                if (csg_stristr(name, s_volume_keys[k])) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) continue;
+
+            long vol_min = snd_ctl_elem_info_get_min(info);
+            long vol_max = snd_ctl_elem_info_get_max(info);
+            long vol_range = vol_max - vol_min;
+            long vol_target;
+
+            /* ★ 范围 ≤ 2 的控件 (如 0-1 布尔型音量) 直接设为最大值,
+             * 否则 80% 计算: 0 + 1*80/100 = 0 → 等价于静音.
+             * 范围 > 2 的正常音量控件设为 80%. */
+            if (vol_range <= 2) {
+                vol_target = vol_max;
+            } else {
+                vol_target = vol_min + vol_range * 80 / 100;  /* 80% */
+            }
+
+            snd_ctl_elem_value_t *val;
+            snd_ctl_elem_value_alloca(&val);
+            snd_ctl_elem_value_set_id(val, eid);
+            ret = snd_ctl_elem_read(ctl, val);
+            if (ret < 0) continue;
+
+            /* 双声道都设置 */
+            for (unsigned int ch = 0; ch <= idx; ch++) {
+                long cur = snd_ctl_elem_value_get_integer(val, ch);
+                if (cur != vol_target) {
+                    snd_ctl_elem_value_set_integer(val, ch, vol_target);
+                }
+            }
+            ret = snd_ctl_elem_write(ctl, val);
+            if (ret >= 0) {
+                CSG_LOGI("AUDIO_RENDER", "Mixer VOL: %s[%u] → %ld (range %ld~%ld, 80%%)",
+                     name, idx, vol_target, vol_min, vol_max);
+                volume_count++;
+            } else {
+                CSG_LOGW("AUDIO_RENDER", "Mixer VOL: %s[%u] write failed: %s",
+                     name, idx, snd_strerror(ret));
+            }
+        }
+    }
+
+    snd_ctl_elem_list_free_space(elist);
+    snd_ctl_close(ctl);
+
+    if (switch_count == 0 && volume_count == 0) {
+        CSG_LOGW("AUDIO_RENDER", "Mixer: NO controls matched! "
+             "Check 'amixer -c %d controls' for actual names.", card);
+    } else {
+        CSG_LOGI("AUDIO_RENDER", "Mixer done: %d switches enabled, %d volumes set",
+             switch_count, volume_count);
+    }
+}
+
+void csg_audio_render_destroy(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx) return;
+
+    csg_audio_render_stop(ctx);
+
+    if (ctx->pcm) {
+        snd_pcm_drain(ctx->pcm);
+        snd_pcm_close(ctx->pcm);
+        ctx->pcm = NULL;
+    }
+
+    pthread_mutex_destroy(&ctx->ring_mutex);
+    pthread_mutex_destroy(&ctx->clock_mutex);
+
+    CSG_LOGI("AUDIO_RENDER", "Destroyed (underruns=%d)", ctx->underrun_count);
+    free(ctx);
+}
+
+static void *csg_audio_render_thread(void *arg)
+{
+    csg_audio_render_ctx_t *ctx = (csg_audio_render_ctx_t *)arg;
+
+    CSG_LOGI("AUDIO_RENDER", "Thread started");
+
+    /* 预缓冲: 等待环形缓冲积累至少 2 个 slot 再开始写 ALSA */
+    while (ctx->running && ctx->playing) {
+        pthread_mutex_lock(&ctx->ring_mutex);
+        int avail = (ctx->write_idx - ctx->read_idx + RING_BUFFER_SLOTS)
+                    % RING_BUFFER_SLOTS;
+        pthread_mutex_unlock(&ctx->ring_mutex);
+        if (avail >= 2) break;
+        usleep(10000);
+    }
+
+    while (ctx->running) {
+        int has_data = 0;
+        int16_t *out_buf = NULL;
+        int out_samples = 0;
+        int64_t out_pts = 0;
+
+        /* ★ 记录当前代际: flush 后会递增, 用于检测旧帧.
+         * 音频线程在 flush 前读出的帧会在 flush 后检测到
+         * 代际变化, 从而丢弃旧帧, 不写 ALSA, 不更新时钟. */
+        int saved_gen = ctx->flush_gen;
+
+        pthread_mutex_lock(&ctx->ring_mutex);
+
+        /* ★ 跳过被生产者作废的 slot: 缓冲区满时丢弃最旧帧会把 read_idx
+         * 推进并置 valid=0 (见 csg_audio_render_write). 若不跳过, 此处
+         * read_idx != write_idx 恒真但 slot 无效, 消费者既不写 ALSA 也
+         * 不进静音分支 (has_new 恒真), 死循环卡死 → 本地播放完全无声.
+         * 跳过无效 slot 后要么命中下一个有效帧, 要么 read_idx 追上
+         * write_idx 走正常空缓冲分支. */
+        while (ctx->read_idx != ctx->write_idx &&
+               !ctx->slots[ctx->read_idx].valid) {
+            ctx->read_idx = (ctx->read_idx + 1) % RING_BUFFER_SLOTS;
+        }
+
+        if (ctx->read_idx != ctx->write_idx) {
+            csg_audio_render_ring_slot_t *slot = &ctx->slots[ctx->read_idx];
+            if (slot->valid) {
+                out_buf = slot->data;
+                out_samples = slot->samples;
+                out_pts = slot->pts;
+                slot->valid = 0;
+                ctx->read_idx = (ctx->read_idx + 1) % RING_BUFFER_SLOTS;
+                has_data = 1;
+            }
+        }
+        pthread_mutex_unlock(&ctx->ring_mutex);
+
+        if (has_data && out_buf && out_samples > 0) {
+            /* ★ 代际检查: 若 flush 在读帧之后发生, 此帧属于旧位置,
+             * 丢弃不写 ALSA, 防止旧音频数据污染输出. */
+            if (ctx->flush_gen != saved_gen) {
+                CSG_LOGI("AUDIO_RENDER", "Discard stale frame pts=%lld "
+                     "(gen %d->%d)", (long long)out_pts,
+                     saved_gen, ctx->flush_gen);
+                continue;
+            }
+
+            /* 写前准备: 检测 ALSA 状态 */
+            snd_pcm_state_t state = snd_pcm_state(ctx->pcm);
+            if (state == SND_PCM_STATE_XRUN) {
+                snd_pcm_prepare(ctx->pcm);
+                ctx->underrun_count++;
+                CSG_LOGW("AUDIO_RENDER", "XRUN recovered (#%d)", ctx->underrun_count);
+            } else if (state == SND_PCM_STATE_SUSPENDED) {
+                snd_pcm_resume(ctx->pcm);
+            }
+
+            /* 硬件音量调节 */
+            if (ctx->muted) {
+                memset(out_buf, 0, out_samples * ctx->frame_bytes);
+            } else if (ctx->volume < 100) {
+                float vol = ctx->volume / 100.0f;
+                for (int i = 0; i < out_samples * ctx->channels; i++) {
+                    out_buf[i] = (int16_t)(out_buf[i] * vol);
+                }
+            }
+
+            /* ★ 倍速音频处理: speed > 1.0 时丢弃采样实现快放效果.
+             *   原理: 每隔 step 个采样保留 1 个, 步长 = (int)speed.
+             *   例: 2x → 每 2 个采样保留 1 个 (丢弃一半)
+             *       4x → 每 4 个采样保留 1 个 (丢弃 3/4)
+             *       16x → 每 16 个采样保留 1 个 (丢弃 15/16)
+             *
+             *   注意: 原位修改, 不分配新内存;
+             *         步长向下取整, 非整数倍速 (如 1.5x) 也兼容.
+             *
+             *   时钟影响: 当前时钟是纯墙上插值 (base_pts + delta*speed),
+             *   丢弃采样后音频以 speed 倍率播放, 时钟以 speed 倍率推进,
+             *   两者天然匹配, 无需额外时钟调整. */
+            if (ctx->speed > 1.0f && out_samples > 0) {
+                int step = (int)(ctx->speed + 0.5f);  /* 四舍五入取整 */
+                if (step < 2) step = 2;
+                int ch = ctx->channels;
+                int total_out = out_samples / step;
+                if (total_out > 0) {
+                    for (int i = 0; i < total_out; i++) {
+                        for (int c = 0; c < ch; c++) {
+                            out_buf[i * ch + c] = out_buf[i * step * ch + c];
+                        }
+                    }
+                    out_samples = total_out;
+                } else {
+                    /* 帧太短 (不足 step 个采样), 丢弃整个帧 */
+                    continue;
+                }
+            }
+
+            /* 写入 ALSA */
+            snd_pcm_sframes_t frames = snd_pcm_writei(ctx->pcm, out_buf,
+                                                       out_samples);
+            if (frames < 0) {
+                /* 欠载或错误, 恢复 */
+                frames = snd_pcm_recover(ctx->pcm, frames, 1);
+                if (frames < 0) {
+                    CSG_LOGW("AUDIO_RENDER", "snd_pcm_writei failed: %s",
+                         snd_strerror(frames));
+                    /* 恢复失败: 尝试 prepare 完整复位, 退避 10ms 防死循环 */
+                    snd_pcm_prepare(ctx->pcm);
+                    ctx->underrun_count++;
+                    /* 回退 read_idx, 下次重试 */
+                    pthread_mutex_lock(&ctx->ring_mutex);
+                    ctx->read_idx = (ctx->read_idx - 1 + RING_BUFFER_SLOTS)
+                                    % RING_BUFFER_SLOTS;
+                    ctx->slots[ctx->read_idx].valid = 1;
+                    pthread_mutex_unlock(&ctx->ring_mutex);
+                    usleep(10000);
+                    continue;
+                }
+            }
+
+            if (frames > 0) {
+                /* ★ 代际再检查: ALSA 写入期间可能发生 flush,
+                 * 若代际已变, 跳过时钟更新, 防止旧 PTS 覆盖. */
+                if (ctx->flush_gen != saved_gen) {
+                    CSG_LOGI("AUDIO_RENDER", "Skip clock update for stale frame "
+                         "pts=%lld (gen %d->%d)", (long long)out_pts,
+                         saved_gen, ctx->flush_gen);
+                    continue;
+                }
+
+                /* ============================================================
+                 * ★ 时钟锚点管理
+                 *
+                 * 层次:
+                 *   ① seek_pending: adjust_clock 已临时设为视频 PTS,
+                 *      首帧音频到达时重新校准为音频 PTS, 消除唇音偏移.
+                 *      (Seek 后音频 PTS 与视频 PTS 存在容器偏移, 如 2s)
+                 *   ② !clock_init_done: 首次启动, 一次性初始化锚点
+                 *      (用 clock_init_done 标志替代 base_pts<=0,
+                 *       避免 PTS=0 时 0<=0 重复触发 → base_wall 丢失时间差)
+                 *   ③ 其他: 锚点不变, 时钟由墙上时钟线性插值推进
+                 * ============================================================ */
+                pthread_mutex_lock(&ctx->clock_mutex);
+
+                if (ctx->seek_pending) {
+                    /* Seek 后首帧音频 → 校准锚点为音频 PTS */
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    ctx->base_wall_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+                    ctx->base_pts = out_pts;
+                    ctx->last_clock = out_pts;
+                    ctx->seek_pending = 0;
+                    ctx->clock_init_done = 1;
+                    CSG_LOGI("AUDIO_RENDER", "Clock recalibrated to audio "
+                         "PTS=%lld (seek_pending cleared)",
+                         (long long)out_pts);
+                } else if (!ctx->clock_init_done) {
+                    /* 首次启动: 一次性初始化 (用标志位, 防 PTS=0 重复) */
+                    struct timespec ts;
+                    clock_gettime(CLOCK_MONOTONIC, &ts);
+                    ctx->base_wall_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+                    ctx->base_pts = out_pts;
+                    ctx->last_clock = out_pts;
+                    ctx->clock_init_done = 1;
+                    CSG_LOGI("AUDIO_RENDER", "Clock init: base_pts=%lld "
+                         "(one-time, never updated again)",
+                         (long long)out_pts);
+                }
+
+                ctx->played_samples += frames;
+                ctx->total_played += frames;
+                pthread_mutex_unlock(&ctx->clock_mutex);
+            }
+        } else {
+            /* 环形缓冲为空 → 用 snd_pcm_wait 阻塞等待硬件就绪,
+             * 若超时仍无数据, 写入静音帧防止 XRUN 连锁触发 */
+            int poll_ret = snd_pcm_wait(ctx->pcm, 100);  /* 100ms 超时 */
+            if (poll_ret < 0) {
+                /* 设备可能处于错误状态 (如 suspend 后未恢复),
+                 * 尝试 prepare 复位, 避免后续 silence 写入持续失败 */
+                snd_pcm_prepare(ctx->pcm);
+            }
+
+            /* 再次检查环形缓冲 (可能在等待期间被填充) */
+            pthread_mutex_lock(&ctx->ring_mutex);
+            int has_new = (ctx->read_idx != ctx->write_idx);
+            pthread_mutex_unlock(&ctx->ring_mutex);
+
+            if (!has_new) {
+                /* 真的无数据: 写入静音帧防止硬件欠载 */
+                int16_t silence[ALSA_PERIOD_SIZE * 2];
+                memset(silence, 0, sizeof(silence));
+                snd_pcm_sframes_t sf = snd_pcm_writei(ctx->pcm, silence,
+                                                       ALSA_PERIOD_SIZE);
+                if (sf < 0) {
+                    sf = snd_pcm_recover(ctx->pcm, sf, 1);
+                    if (sf < 0) {
+                        /* recover 失败: 设备可能处于致命错误状态,
+                         * 尝试 prepare 完整复位; 无论成败都退避 10ms
+                         * 防止死循环刷屏 (百万次/秒) */
+                        snd_pcm_prepare(ctx->pcm);
+                        ctx->underrun_count++;
+                        CSG_LOGW("AUDIO_RENDER", "silence write failed, XRUN (#%d)",
+                             ctx->underrun_count);
+                        usleep(10000);  /* 10ms 退避 */
+                    }
+                }
+            }
+        }
+    }
+
+    CSG_LOGI("AUDIO_RENDER", "Thread stopped");
+    return NULL;
+}
+
+int csg_audio_render_start(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx || !ctx->pcm) return -1;
+
+    if (ctx->running) return 0;
+
+    /* 准备 PCM */
+    int ret = snd_pcm_prepare(ctx->pcm);
+    if (ret < 0) {
+        CSG_LOGE("AUDIO_RENDER", "snd_pcm_prepare failed: %s", snd_strerror(ret));
+        return -1;
+    }
+
+    /* 清空环形缓冲 */
+    pthread_mutex_lock(&ctx->ring_mutex);
+    for (int i = 0; i < RING_BUFFER_SLOTS; i++) {
+        ctx->slots[i].valid = 0;
+    }
+    ctx->write_idx = 0;
+    ctx->read_idx = 0;
+    pthread_mutex_unlock(&ctx->ring_mutex);
+
+    /* 重置时钟 */
+    pthread_mutex_lock(&ctx->clock_mutex);
+    ctx->base_pts = 0;
+    ctx->base_wall_us = 0;
+    ctx->last_clock = 0;
+    ctx->played_samples = 0;
+    ctx->clock_ema = 0;
+    ctx->clock_ema_valid = 0;
+    pthread_mutex_unlock(&ctx->clock_mutex);
+
+    ctx->running = 1;
+    ctx->playing = 1;
+
+    ret = pthread_create(&ctx->thread, NULL, csg_audio_render_thread, ctx);
+    if (ret != 0) {
+        CSG_LOGE("AUDIO_RENDER", "pthread_create failed: %d", ret);
+        ctx->running = 0;
+        ctx->playing = 0;
+        return -1;
+    }
+
+    CSG_LOGI("AUDIO_RENDER", "Started");
+    return 0;
+}
+
+void csg_audio_render_stop(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx) return;
+    if (!ctx->running) return;
+
+    ctx->running = 0;
+    pthread_join(ctx->thread, NULL);
+    ctx->playing = 0;
+
+    if (ctx->pcm) {
+        snd_pcm_drop(ctx->pcm);
+    }
+
+    CSG_LOGI("AUDIO_RENDER", "Stopped");
+}
+
+int csg_audio_render_write(csg_audio_render_ctx_t *ctx, const void *data,
+                       int samples, int64_t pts)
+{
+    if (!ctx || !ctx->running || !data || samples <= 0) return -1;
+
+    int next_write = (ctx->write_idx + 1) % RING_BUFFER_SLOTS;
+
+    pthread_mutex_lock(&ctx->ring_mutex);
+
+    /* 检查缓冲区是否满 (环形缓冲写指针追赶读指针) */
+    if (next_write == ctx->read_idx) {
+        /* 缓冲区满, 丢弃最旧的一帧: 推进 read_idx 跳过最旧帧,
+         * 并把新的读位置标记无效, 渲染线程跳过无效 slot 继续消费
+         * (见 csg_audio_render_thread 读路径). */
+        ctx->read_idx = (ctx->read_idx + 1) % RING_BUFFER_SLOTS;
+        ctx->slots[ctx->read_idx].valid = 0;
+        pthread_mutex_unlock(&ctx->ring_mutex);
+        return 1;  /* 返回值 1 表示丢弃 */
+    }
+
+    csg_audio_render_ring_slot_t *slot = &ctx->slots[ctx->write_idx];
+
+    int copy_samples = samples;
+    if (copy_samples > MAX_SAMPLES_PER_SLOT) {
+        copy_samples = MAX_SAMPLES_PER_SLOT;
+    }
+
+    int copy_bytes = copy_samples * ctx->frame_bytes;
+    memcpy(slot->data, data, copy_bytes);
+    slot->samples = copy_samples;
+    slot->pts = pts;
+    slot->valid = 1;
+
+    ctx->write_idx = next_write;
+    ctx->total_written += copy_samples;
+
+    pthread_mutex_unlock(&ctx->ring_mutex);
+
+    return 0;
+}
+
+int64_t csg_audio_render_get_clock(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx) return 0;
+
+    /* 暂停时冻结时钟: 暂停期间 base_wall_us 不再更新,
+     * 若继续插值时钟会持续跑偏, 导致恢复播放时同步跳变. */
+    if (!ctx->playing) {
+        return ctx->last_clock;
+    }
+
+    /* ★ 先算缓冲延迟 (不持 clock_mutex, 避免 ring_mutex → clock_mutex 死锁)
+     * 必须在此处计算, 因为 get_delay 会取 ring_mutex, 而音频线程的锁顺序是
+     * ring_mutex → clock_mutex (写 ALSA 后更新播放计数). 若在持 clock_mutex
+     * 时调 get_delay, 锁顺序逆转为 clock_mutex → ring_mutex, 可能死锁. */
+    int64_t delay_us = csg_audio_render_get_delay(ctx);
+
+    pthread_mutex_lock(&ctx->clock_mutex);
+
+    if (!ctx->clock_init_done || ctx->sample_rate <= 0) {
+        pthread_mutex_unlock(&ctx->clock_mutex);
+        return 0;
+    }
+
+    /* ★ 纯墙上时钟插值: 锚点永不更新, 时钟由 CLOCK_MONOTONIC 线性推进.
+     *
+     * 公式: clock = base_pts + (now - base_wall_us) * speed
+     *
+     * 锚点 (base_pts, base_wall_us) 只在以下时机更新:
+     *   ① adjust_clock: Seek 后设为视频关键帧 PTS
+     *   ② set_speed:    倍速切换时重新校准
+     *   ③ 音频线程首次初始化: base_pts==0 时设为首帧音频 PTS
+     *
+     * 音频线程写完帧后不再更新锚点, 彻底消除:
+     *   - 锚点负跳 + 单调保证导致的时钟停滞 (Seek 后 drift 累积到 372ms)
+     *   - 30% 渐进收敛永远追不上实际位置
+     *   - 倍速下锚点更新与插值相互干扰振荡
+     *
+     * 倍速适配: delta 乘以 speed, 使音频时钟以倍速推进.
+     *
+     * ★ 关键修复: 减去 ALSA 硬件缓冲 + 环形缓冲的播放延迟
+     * 写入 ALSA 的 PCM 数据不会立即播放, 需要经过硬件缓冲排队.
+     * 音频时钟必须反映的是 "当前正在播放" 的 PTS，而不是 "已经写入" 的 PTS.
+     * 因此需要减去总缓冲延迟，否则音频时钟系统性超前，av_offset 补偿失效. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+
+    int64_t delta = now_us - ctx->base_wall_us;
+    float spd = ctx->speed > 0.0f ? ctx->speed : 1.0f;
+    int64_t clock = ctx->base_pts + (int64_t)((double)delta * spd);
+
+    /* 减去当前缓冲延迟: 写入的 PTS → 当前播放的 PTS */
+    if (delay_us > 0 && clock >= delay_us) {
+        clock -= delay_us;
+    }
+
+    /* 调试: 仅当 delta 为负 (时钟倒退, 真正异常) 时打印, 且限频.
+     * ★ 历史踩坑: 原条件 delta>10000000 在播放超 10 秒后每帧触发
+     *   (正常播放 delta 就是墙钟流逝), 造成串口日志风暴, 阻塞调用线程
+     *   导致 UI 卡顿/花屏, 必须移除. */
+    if (delta < 0 && (ctx->clock_dbg_cnt++ % 200) == 0) {
+        CSG_LOGI("AUDIO_RENDER", "CLOCK-DBG: base_pts=%lld base_wall=%lld "
+             "now=%lld delta=%lld delay=%lld playing=%d",
+             (long long)ctx->base_pts, (long long)ctx->base_wall_us,
+             (long long)now_us, (long long)delta, (long long)delay_us, ctx->playing);
+    }
+
+    /* 单调保证: 仅保留安全网, 锚点不更新后基本不会触发 */
+    if (clock < ctx->last_clock) {
+        clock = ctx->last_clock;
+    } else {
+        ctx->last_clock = clock;
+    }
+
+    pthread_mutex_unlock(&ctx->clock_mutex);
+    return clock;
+}
+
+int64_t csg_audio_render_get_delay(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx) return 0;
+
+    pthread_mutex_lock(&ctx->ring_mutex);
+
+    /* 环形缓冲中等待播放的采样数 */
+    int pending = 0;
+    int idx = ctx->read_idx;
+    while (idx != ctx->write_idx) {
+        if (ctx->slots[idx].valid) {
+            pending += ctx->slots[idx].samples;
+        }
+        idx = (idx + 1) % RING_BUFFER_SLOTS;
+    }
+    pthread_mutex_unlock(&ctx->ring_mutex);
+
+    /* ALSA 硬件缓冲中未播放的帧数 */
+    snd_pcm_sframes_t delay_frames = 0;
+    if (ctx->pcm) {
+        snd_pcm_delay(ctx->pcm, &delay_frames);
+        if (delay_frames < 0) delay_frames = 0;
+    }
+
+    int64_t total_samples = pending + delay_frames;
+    int64_t delay_us = (int64_t)((double)total_samples
+                                  / ctx->sample_rate * 1000000.0);
+    return delay_us;
+}
+
+void csg_audio_render_pause(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx) return;
+    if (!ctx->playing) return;
+
+    ctx->playing = 0;
+
+    if (ctx->pcm) {
+        snd_pcm_drop(ctx->pcm);
+    }
+
+    /* 清空环形缓冲 */
+    pthread_mutex_lock(&ctx->ring_mutex);
+    for (int i = 0; i < RING_BUFFER_SLOTS; i++) {
+        ctx->slots[i].valid = 0;
+    }
+    ctx->write_idx = 0;
+    ctx->read_idx = 0;
+    pthread_mutex_unlock(&ctx->ring_mutex);
+
+    CSG_LOGI("AUDIO_RENDER", "Paused");
+}
+
+void csg_audio_render_resume(csg_audio_render_ctx_t *ctx)
+{
+    if (!ctx) return;
+    if (ctx->playing) return;
+
+    ctx->playing = 1;
+
+    if (ctx->pcm) {
+        snd_pcm_prepare(ctx->pcm);
+    }
+
+    /* ★ 恢复时重校准时钟锚点: 暂停期间 base_wall_us 未更新,
+     * 若不重设, 恢复后 clock = base_pts + (now - base_wall_old) * speed
+     * 会直接跳变暂停时长 (本日志中跳了 13 秒), 导致全部帧被 DROP.
+     *
+     * 修复: base_pts = 冻结的 last_clock, base_wall_us = 当前系统时间,
+     * 恢复后 clock = last_clock + (now - now) = last_clock, 零跳变. */
+    pthread_mutex_lock(&ctx->clock_mutex);
+    if (ctx->last_clock > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        ctx->base_pts = ctx->last_clock;
+        ctx->base_wall_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+        CSG_LOGI("AUDIO_RENDER", "Resume clock recal: base_pts=%lld, wall=%lld",
+             (long long)ctx->base_pts, (long long)ctx->base_wall_us);
+    }
+    pthread_mutex_unlock(&ctx->clock_mutex);
+
+    CSG_LOGI("AUDIO_RENDER", "Resumed");
+}
+
+void csg_audio_render_flush(csg_audio_render_ctx_t *ctx, int64_t new_base_pts)
+{
+    if (!ctx) return;
+
+    if (ctx->pcm) {
+        snd_pcm_drop(ctx->pcm);
+        snd_pcm_prepare(ctx->pcm);
+
+        /* 预填充静音帧: Seek 后音频数据到达需要时间 (解码+重采样+缓冲),
+         * 先写 2 个 period 的静音到 ALSA 硬件缓冲, 避免立即 XRUN.
+         * 停顿感极短 (约 40ms @ 48kHz period=1024), 远好于 XRUN 爆音. */
+        int16_t silence[4096] = {0};
+        int silence_frames = ALSA_PERIOD_SIZE * 2;
+        if (silence_frames > 4096 / ctx->channels) {
+            silence_frames = 4096 / ctx->channels;
+        }
+        snd_pcm_sframes_t sf = snd_pcm_writei(ctx->pcm, silence, silence_frames);
+        if (sf < 0) {
+            /* 写入失败: 尝试 recover + prepare 恢复设备 */
+            snd_pcm_recover(ctx->pcm, sf, 1);
+            snd_pcm_prepare(ctx->pcm);
+            snd_pcm_writei(ctx->pcm, silence, silence_frames);
+        }
+    }
+
+    pthread_mutex_lock(&ctx->ring_mutex);
+    for (int i = 0; i < RING_BUFFER_SLOTS; i++) {
+        ctx->slots[i].valid = 0;
+    }
+    ctx->write_idx = 0;
+    ctx->read_idx = 0;
+    /* ★ flush 代际递增: 通知音频线程丢弃所有旧帧,
+     * 防止旧 PTS 帧在 flush 后覆盖时钟. */
+    ctx->flush_gen++;
+    /* ★ Seek 待处理标志: 下一帧音频到达时校准时钟锚点为音频 PTS. */
+    ctx->seek_pending = 1;
+    ctx->clock_init_done = 0;  /* 复位, 允许音频线程重新初始化锚点 */
+    pthread_mutex_unlock(&ctx->ring_mutex);
+
+    /* 音频时钟复位:
+     * new_base_pts > 0  → Seek 场景: 直接设为目标 PTS + 当前时间锚点
+     * new_base_pts = 0  → 普通停止: 归零, 首帧到达时自动初始化 */
+    pthread_mutex_lock(&ctx->clock_mutex);
+    ctx->base_pts = new_base_pts;
+    if (new_base_pts > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        ctx->base_wall_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+        ctx->last_clock = new_base_pts;
+        ctx->clock_ema = new_base_pts;
+        ctx->clock_ema_valid = 1;
+    } else {
+        ctx->base_wall_us = 0;
+        ctx->last_clock = 0;
+        ctx->clock_ema = 0;
+        ctx->clock_ema_valid = 0;
+    }
+    ctx->played_samples = 0;
+    pthread_mutex_unlock(&ctx->clock_mutex);
+
+    CSG_LOGI("AUDIO_RENDER", "Flushed (base_pts=%lld)", (long long)new_base_pts);
+}
+
+void csg_audio_render_adjust_clock(csg_audio_render_ctx_t *ctx, int64_t new_base_pts)
+{
+    if (!ctx || new_base_pts <= 0) return;
+
+    pthread_mutex_lock(&ctx->clock_mutex);
+    ctx->base_pts = new_base_pts;
+    /* ★ base_wall_us 必须同步设为当前时间, 不能留 0!
+     * 否则 clock = base_pts + (now - 0) 会把系统 uptime 全加进去,
+     * 导致时钟值膨胀到 23933 秒, 引发后续内存异常崩溃. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    ctx->base_wall_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+    ctx->last_clock = new_base_pts;
+    ctx->clock_ema = new_base_pts;
+    ctx->clock_ema_valid = 1;
+    ctx->played_samples = 0;
+    pthread_mutex_unlock(&ctx->clock_mutex);
+
+    CSG_LOGI("AUDIO_RENDER", "Clock adjusted to %lldus (wall=%lldus)",
+         (long long)new_base_pts, (long long)ctx->base_wall_us);
+}
+
+void csg_audio_render_set_speed(csg_audio_render_ctx_t *ctx, float speed)
+{
+    if (!ctx) return;
+    if (speed < 0.25f) speed = 0.25f;
+    if (speed > 16.0f) speed = 16.0f;
+
+    pthread_mutex_lock(&ctx->clock_mutex);
+
+    /* ★ 倍速切换时必须重新校准锚点, 否则时钟推进速率与实际音频播放速率不匹配.
+     * 问题: 只改speed不改锚点, get_clock用新speed × 旧锚点时间差,
+     *      但音频线程写入PCM速率仍是1x, 导致时钟严重落后.
+     * 解决: 计算当前时钟, 以此为新的base_pts, 当前时间为新的base_wall_us,
+     *      使时钟从此刻开始以新speed正确推进. */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t now_us = ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+
+    /* 用旧speed计算当前时钟 */
+    float old_speed = ctx->speed > 0.0f ? ctx->speed : 1.0f;
+    int64_t current_clock = 0;
+    if (ctx->base_pts > 0 && ctx->base_wall_us > 0) {
+        current_clock = ctx->base_pts
+                      + (int64_t)((double)(now_us - ctx->base_wall_us) * old_speed);
+    } else if (ctx->last_clock > 0) {
+        current_clock = ctx->last_clock;
+    }
+
+    /* 更新speed */
+    ctx->speed = speed;
+
+    /* 重新设置锚点: 以当前时钟为基准, 从此刻开始以新speed推进 */
+    if (current_clock > 0) {
+        ctx->base_pts = current_clock;
+        ctx->base_wall_us = now_us;
+        CSG_LOGI("AUDIO_RENDER", "Speed anchor recalibrated: speed=%.2f, base_pts=%lld, wall=%lld",
+             speed, (long long)ctx->base_pts, (long long)ctx->base_wall_us);
+    }
+
+    pthread_mutex_unlock(&ctx->clock_mutex);
+
+    /* ★ 所有倍速均保持音频输出, 不静音.
+     * 高倍速 (≥4x) 下音频采样被稀释 (step=speed), 音质下降但可辨识,
+     * 用户可通过耳机听到快放效果 (类似"叽叽喳喳"的快进声音).
+     * 同步策略: 高倍速下音频时钟锚定由 main.c 的 AV-SYNC 层管理,
+     * 每显示一帧视频后将音频时钟同步到该帧 PTS,
+     * 使下一帧的 frame_timer = (next_pts - current_pts) / speed 正确反映帧间隔. */
+    ctx->muted = 0;
+}
+
+void csg_audio_render_set_volume(csg_audio_render_ctx_t *ctx, int volume)
+{
+    if (!ctx) return;
+    if (volume < 0) volume = 0;
+    if (volume > 100) volume = 100;
+    ctx->volume = volume;
+}
+
+void csg_audio_render_set_mute(csg_audio_render_ctx_t *ctx, int mute)
+{
+    if (!ctx) return;
+    ctx->muted = mute ? 1 : 0;
+}
+
+int csg_audio_render_get_volume(csg_audio_render_ctx_t *ctx)
+{
+    return ctx ? ctx->volume : 0;
+}
+
+int csg_audio_render_get_mute(csg_audio_render_ctx_t *ctx)
+{
+    return ctx ? ctx->muted : 0;
+}
+
+int csg_audio_render_is_playing(csg_audio_render_ctx_t *ctx)
+{
+    return ctx ? ctx->playing : 0;
+}

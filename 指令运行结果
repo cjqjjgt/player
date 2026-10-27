@@ -1,0 +1,278 @@
+
+root@ok3572-buildroot:/userdata#  chmod +x diag_gpio.sh && ./diag_gpio.sh
+=== 1. NAU8822 全部控件列表 ===
+numid=76,iface=CARD,name='Headphone Jack'
+numid=78,iface=CARD,name='Headset Mic Jack'
+numid=77,iface=CARD,name='Speaker Jack'
+numid=64,iface=MIXER,name='Headphone ZC Switch'
+numid=81,iface=MIXER,name='Headphone Switch'
+numid=66,iface=MIXER,name='Headphone Volume'
+numid=65,iface=MIXER,name='Headphone Playback Switch'
+numid=42,iface=MIXER,name='PCM Volume'
+numid=73,iface=MIXER,name='Aux Boost Volume'
+numid=75,iface=MIXER,name='ADC 128x Oversampling Switch'
+numid=37,iface=MIXER,name='ADC Companding'
+numid=45,iface=MIXER,name='ADC Inversion Switch'
+numid=46,iface=MIXER,name='ADC Volume'
+numid=108,iface=MIXER,name='Digital Loopback Switch'
+numid=59,iface=MIXER,name='ALC Attack'
+numid=58,iface=MIXER,name='ALC Decay'
+numid=53,iface=MIXER,name='ALC Enable Switch'
+numid=56,iface=MIXER,name='ALC Hold'
+numid=55,iface=MIXER,name='ALC Max Gain'
+numid=54,iface=MIXER,name='ALC Min Gain'
+numid=52,iface=MIXER,name='ALC Mode'
+numid=60,iface=MIXER,name='ALC Noise Gate Switch'
+numid=61,iface=MIXER,name='ALC Noise Gate Threshold'
+numid=57,iface=MIXER,name='ALC Target'
+numid=96,iface=MIXER,name='AUX1 Output Mixer LDAC Switch'
+numid=97,iface=MIXER,name='AUX1 Output Mixer LMIX Switch'
+numid=93,iface=MIXER,name='AUX1 Output Mixer RDAC Switch'
+numid=95,iface=MIXER,name='AUX1 Output Mixer RINMIX Switch'
+numid=94,iface=MIXER,name='AUX1 Output Mixer RMIX Switch'
+numid=101,iface=MIXER,name='AUX2 Output Mixer AUX1MIX Output Switch'
+numid=98,iface=MIXER,name='AUX2 Output Mixer LDAC Switch'
+numid=100,iface=MIXER,name='AUX2 Output Mixer LINMIX Switch'
+numid=99,iface=MIXER,name='AUX2 Output Mixer LMIX Switch'
+numid=70,iface=MIXER,name='AUXOUT Playback Switch'
+numid=74,iface=MIXER,name='DAC 128x Oversampling Switch'
+numid=38,iface=MIXER,name='DAC Companding'
+numid=41,iface=MIXER,name='DAC Inversion Switch'
+numid=49,iface=MIXER,name='DAC Limiter Attack'
+numid=48,iface=MIXER,name='DAC Limiter Decay'
+numid=47,iface=MIXER,name='DAC Limiter Switch'
+numid=50,iface=MIXER,name='DAC Limiter Threshold'
+numid=51,iface=MIXER,name='DAC Limiter Volume'
+numid=39,iface=MIXER,name='EQ Function'
+numid=40,iface=MIXER,name='EQ Parameters'
+numid=84,iface=MIXER,name='Headset Mic Switch'
+numid=44,iface=MIXER,name='High Pass Cut Off'
+numid=43,iface=MIXER,name='High Pass Filter Switch'
+numid=72,iface=MIXER,name='L2/R2 Boost Volume'
+numid=102,iface=MIXER,name='Left Input Mixer L2 Switch'
+numid=103,iface=MIXER,name='Left Input Mixer MicN Switch'
+numid=104,iface=MIXER,name='Left Input Mixer MicP Switch'
+numid=86,iface=MIXER,name='Left Output Mixer LAUX Switch'
+numid=87,iface=MIXER,name='Left Output Mixer LDAC Switch'
+numid=85,iface=MIXER,name='Left Output Mixer LINMIX Switch'
+numid=88,iface=MIXER,name='Left Output Mixer RDAC Switch'
+numid=83,iface=MIXER,name='Main Mic Switch'
+numid=71,iface=MIXER,name='PGA Boost Volume'
+numid=63,iface=MIXER,name='PGA Volume'
+numid=62,iface=MIXER,name='PGA ZC Switch'
+numid=106,iface=MIXER,name='Right Input Mixer MicN Switch'
+numid=107,iface=MIXER,name='Right Input Mixer MicP Switch'
+numid=105,iface=MIXER,name='Right Input Mixer R2 Switch'
+numid=92,iface=MIXER,name='Right Output Mixer LDAC Switch'
+numid=90,iface=MIXER,name='Right Output Mixer RAUX Switch'
+numid=91,iface=MIXER,name='Right Output Mixer RDAC Switch'
+numid=89,iface=MIXER,name='Right Output Mixer RINMIX Switch'
+numid=34,iface=MIXER,name='SAI1 Clk Auto Switch'
+numid=5,iface=MIXER,name='SAI1 Receive Mono Slot Select'
+numid=6,iface=MIXER,name='SAI1 Receive Mono Switch'
+numid=29,iface=MIXER,name='SAI1 Receive PATH0 Source Select'
+numid=28,iface=MIXER,name='SAI1 Receive PATH1 Source Select'
+numid=27,iface=MIXER,name='SAI1 Receive PATH2 Source Select'
+numid=26,iface=MIXER,name='SAI1 Receive PATH3 Source Select'
+numid=4,iface=MIXER,name='SAI1 Receive SDIx Select'
+numid=2,iface=MIXER,name='SAI1 Receive Start Mode Sel'
+numid=11,iface=MIXER,name='SAI1 SDI0 Loopback I2S LR Channel Sel'
+numid=15,iface=MIXER,name='SAI1 SDI0 Loopback I2S LR Switch'
+numid=19,iface=MIXER,name='SAI1 SDI0 Loopback Src Select'
+numid=23,iface=MIXER,name='SAI1 SDI0 Loopback Switch'
+numid=10,iface=MIXER,name='SAI1 SDI1 Loopback I2S LR Channel Sel'
+numid=14,iface=MIXER,name='SAI1 SDI1 Loopback I2S LR Switch'
+numid=18,iface=MIXER,name='SAI1 SDI1 Loopback Src Select'
+numid=22,iface=MIXER,name='SAI1 SDI1 Loopback Switch'
+numid=9,iface=MIXER,name='SAI1 SDI2 Loopback I2S LR Channel Sel'
+numid=13,iface=MIXER,name='SAI1 SDI2 Loopback I2S LR Switch'
+numid=17,iface=MIXER,name='SAI1 SDI2 Loopback Src Select'
+numid=21,iface=MIXER,name='SAI1 SDI2 Loopback Switch'
+numid=8,iface=MIXER,name='SAI1 SDI3 Loopback I2S LR Channel Sel'
+numid=12,iface=MIXER,name='SAI1 SDI3 Loopback I2S LR Switch'
+numid=16,iface=MIXER,name='SAI1 SDI3 Loopback Src Select'
+numid=20,iface=MIXER,name='SAI1 SDI3 Loopback Switch'
+numid=25,iface=MIXER,name='SAI1 Sync In Switch'
+numid=24,iface=MIXER,name='SAI1 Sync Out Switch'
+numid=7,iface=MIXER,name='SAI1 Transmit Mono Switch'
+numid=33,iface=MIXER,name='SAI1 Transmit SDO0 Source Select'
+numid=32,iface=MIXER,name='SAI1 Transmit SDO1 Source Select'
+numid=31,iface=MIXER,name='SAI1 Transmit SDO2 Source Select'
+numid=30,iface=MIXER,name='SAI1 Transmit SDO3 Source Select'
+numid=3,iface=MIXER,name='SAI1 Transmit SDOx Select'
+numid=1,iface=MIXER,name='SAI1 Transmit Start Mode Sel'
+numid=68,iface=MIXER,name='Speaker Playback Switch'
+numid=82,iface=MIXER,name='Speaker Switch'
+numid=69,iface=MIXER,name='Speaker Volume'
+numid=67,iface=MIXER,name='Speaker ZC Switch'
+numid=80,iface=MIXER,name='hp switch'
+numid=79,iface=MIXER,name='spk switch'
+numid=35,iface=PCM,name='SAI1 PCM Read Wait Time MS'
+numid=36,iface=PCM,name='SAI1 PCM Write Wait Time MS'
+
+=== 2. 耳机/喇叭/GPIO 相关控件 ===
+numid=76,iface=CARD,name='Headphone Jack'
+numid=78,iface=CARD,name='Headset Mic Jack'
+numid=77,iface=CARD,name='Speaker Jack'
+numid=64,iface=MIXER,name='Headphone ZC Switch'
+numid=81,iface=MIXER,name='Headphone Switch'
+numid=66,iface=MIXER,name='Headphone Volume'
+numid=65,iface=MIXER,name='Headphone Playback Switch'
+numid=68,iface=MIXER,name='Speaker Playback Switch'
+numid=82,iface=MIXER,name='Speaker Switch'
+numid=69,iface=MIXER,name='Speaker Volume'
+numid=67,iface=MIXER,name='Speaker ZC Switch'
+numid=80,iface=MIXER,name='hp switch'
+numid=79,iface=MIXER,name='spk switch'
+
+=== 3. hp switch 详细状态 ===
+Simple mixer control 'hp switch',0
+  Capabilities: pswitch pswitch-joined
+  Playback channels: Mono
+  Mono: Playback [off]
+
+=== 4. spk switch 详细状态 ===
+Simple mixer control 'spk switch',0
+  Capabilities: pswitch pswitch-joined
+  Playback channels: Mono
+  Mono: Playback [off]
+
+=== 5. 尝试命令行写入后立即回读 ===
+--- 写入 hp switch ---
+numid=80,iface=MIXER,name='hp switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+--- 立即回读 hp switch ---
+numid=80,iface=MIXER,name='hp switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+
+--- 写入 spk switch ---
+numid=79,iface=MIXER,name='spk switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+--- 立即回读 spk switch ---
+numid=79,iface=MIXER,name='spk switch'
+  ; type=BOOLEAN,access=rw------,values=1
+  : values=off
+
+=== 6. Jack Detect / 耳机插入检测 ===
+numid=76,iface=CARD,name='Headphone Jack'
+numid=78,iface=CARD,name='Headset Mic Jack'
+numid=77,iface=CARD,name='Speaker Jack'
+
+=== 7. GPIO sysfs 信息 ===
+--- /sys/class/gpio/ ---
+export  gpiochip0  gpiochip128  gpiochip32  gpiochip512  gpiochip515  gpiochip64  gpiochip96  unexport
+
+--- /sys/kernel/debug/gpio ---
+gpiochip0: GPIOs 0-31, parent: platform/26300000.gpio, gpio0:
+ gpio-0   (                    |interrupt           ) in  hi IRQ
+ gpio-5   (                    |interrupt           ) in  hi IRQ
+ gpio-6   (                    |interrupt           ) in  hi IRQ
+ gpio-10  (                    |WIFI,host_wake      ) in  lo
+ gpio-11  (                    |BT,wake_host        ) in  lo
+ gpio-12  (                    |work                ) out lo
+ gpio-19  (                    |vcc3v3-pcie0        ) out lo
+ gpio-25  (                    |vbus5v0-typec       ) out lo
+
+gpiochip1: GPIOs 32-63, parent: platform/2b200000.gpio, gpio1:
+ gpio-50  (                    |uart_rts            ) in  lo ACTIVE LOW
+ gpio-54  (                    |reset               ) out hi ACTIVE LOW
+ gpio-55  (                    |BT,reset            ) out lo
+ gpio-60  (                    |BT,wake             ) out hi
+
+gpiochip2: GPIOs 64-95, parent: platform/2b300000.gpio, gpio2:
+ gpio-77  (                    |vcc3v3-pcie1        ) out lo
+ gpio-84  (                    |quectel-pwren-mod   ) out lo ACTIVE LOW
+
+gpiochip3: GPIOs 96-127, parent: platform/2b400000.gpio, gpio3:
+ gpio-120 (                    |vcc3v3-lcd          ) out lo
+ gpio-126 (                    |quectel-rst         ) out lo ACTIVE LOW
+ gpio-127 (                    |hp-det              ) in  hi IRQ
+
+gpiochip4: GPIOs 128-159, parent: platform/2b500000.gpio, gpio4:
+ gpio-143 (                    |quectel-pwren       ) out hi
+
+gpiochip5: GPIOs 512-514, parent: platform/rk806-pinctrl.4.auto, rk806-gpio, can sleep:
+
+gpiochip6: GPIOs 515-538, parent: i2c/2-0023, 2-0023, can sleep:
+ gpio-523 (                    |switch-mipi0-dphy12 ) out hi
+ gpio-532 (                    |switch-mipi1-dphy45 ) out hi
+
+=== 8. DAPM debugfs (如果可用) ===
+/sys/kernel/debug/asoc/rockchip-nau8822/dma:2a510000.sai/dapm
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm
+/sys/kernel/debug/asoc/rockchip-nau8822/2a510000.sai/dapm
+/sys/kernel/debug/asoc/rockchip-nau8822/dapm
+/sys/kernel/debug/asoc/rockchip-hdmi/dma:27610000.sai/dapm
+/sys/kernel/debug/asoc/rockchip-hdmi/hdmi-audio-codec.2.auto/dapm
+/sys/kernel/debug/asoc/rockchip-hdmi/27610000.sai/dapm
+/sys/kernel/debug/asoc/rockchip-hdmi/dapm
+/sys/kernel/debug/asoc/rockchip-nau8822/dma:2a510000.sai/dapm/bias_level
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/Capture
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/Playback
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/AUXOUT2
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/AUXOUT1
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/RSPK
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/LSPK
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/RHP
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/LHP
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/R2
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/L2
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/RAUX
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/LAUX
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/RMICP
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/RMICN
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/LMICP
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/LMICN
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/Digital Loopback
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/PLL
+/sys/kernel/debug/asoc/rockchip-nau8822/nau8822.5-001a/dapm/AUX2 Out
+
+=== 9. 设备树 NAU8822 信息 ===
+/sys/firmware/devicetree/base/soc/i2c@2c070000/nau8822@1a
+/sys/firmware/devicetree/base/nau8822-sound
+/sys/firmware/devicetree/base/__symbols__/nau8822_sound
+/sys/firmware/devicetree/base/__symbols__/nau8822
+/sys/firmware/devicetree/base/dsm-sound/simple-audio-card,bitclock-master
+/sys/firmware/devicetree/base/dsm-sound/simple-audio-card,name
+/sys/firmware/devicetree/base/dsm-sound/simple-audio-card,format
+/sys/firmware/devicetree/base/dsm-sound/simple-audio-card,cpu
+/sys/firmware/devicetree/base/dsm-sound/simple-audio-card,codec
+/sys/firmware/devicetree/base/dsm-sound/simple-audio-card,frame-master
+/sys/firmware/devicetree/base/dsm-sound/simple-audio-card,mclk-fs
+/sys/firmware/devicetree/base/spdif-rx0-sound/simple-audio-card,name
+/sys/firmware/devicetree/base/spdif-rx0-sound/simple-audio-card,cpu
+/sys/firmware/devicetree/base/spdif-rx0-sound/simple-audio-card,codec
+/sys/firmware/devicetree/base/spdif-tx0-sound/simple-audio-card,name
+/sys/firmware/devicetree/base/spdif-tx0-sound/simple-audio-card,cpu
+/sys/firmware/devicetree/base/spdif-tx0-sound/simple-audio-card,codec
+/sys/firmware/devicetree/base/spdif-tx0-sound/simple-audio-card,mclk-fs
+/sys/firmware/devicetree/base/clocks/clk-iodet-audio-1@26090000
+/sys/firmware/devicetree/base/clocks/clk-iodet-audio-2@26090000
+/sys/firmware/devicetree/base/clocks/clk-acc-audio-frac-0@26090000
+/sys/firmware/devicetree/base/clocks/clk-acc-audio-frac-1@26090000
+/sys/firmware/devicetree/base/clocks/clk-acc-audio-frac-2@26090000
+/sys/firmware/devicetree/base/clocks/clk-iodet-audio-0@26090000
+/sys/firmware/devicetree/base/nau8822-sound/rockchip,audio-routing
+/sys/firmware/devicetree/base/asrc-sound/simple-audio-card,format
+/sys/firmware/devicetree/base/asrc-sound/rockchip,audio-routing
+/sys/firmware/devicetree/base/__symbols__/clk_iodet_audio_0
+/sys/firmware/devicetree/base/__symbols__/clk_acc_audio_frac_1
+/sys/firmware/devicetree/base/__symbols__/clk_iodet_audio_1
+/sys/firmware/devicetree/base/__symbols__/clk_acc_audio_frac_2
+/sys/firmware/devicetree/base/__symbols__/clk_acc_audio_frac_0
+/sys/firmware/devicetree/base/__symbols__/audio_grf
+/sys/firmware/devicetree/base/__symbols__/clk_iodet_audio_2
+/sys/firmware/devicetree/base/bt-sound/simple-audio-card,name
+/sys/firmware/devicetree/base/bt-sound/simple-audio-card,format
+/sys/firmware/devicetree/base/bt-sound/simple-audio-card,bitclock-inversion
+/sys/firmware/devicetree/base/bt-sound/simple-audio-card,cpu
+/sys/firmware/devicetree/base/bt-sound/simple-audio-card,codec
+/sys/firmware/devicetree/base/bt-sound/simple-audio-card,mclk-fs
+
+=== 10. NAU8822 寄存器 (如果可用) ===
+
+=== 诊断完成 ===
+root@ok3572-buildroot:/userdata#
